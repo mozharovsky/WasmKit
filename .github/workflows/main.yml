@@ -283,7 +283,7 @@ jobs:
   build-wasi:
     runs-on: ubuntu-24.04
     container:
-      image: swift:6.3-noble
+      image: swift:6.3.2-noble
     steps:
       - uses: actions/checkout@v6
       - name: Install jq
