@@ -627,6 +627,10 @@ extension Execution {
     /// Be careful when modifying this function as it is performance-critical.
     @inline(__always)
     mutating func runTokenThreaded(sp: inout Sp, pc: inout Pc, md: inout Md, ms: inout Ms) throws {
+        if let control = store.value.executionControl {
+            try runDispatchGroups(control: control, sp: &sp, pc: &pc, md: &md, ms: &ms)
+            return
+        }
         #if EngineStats
             var stats = StatsCollector()
             defer { stats.dump() }
@@ -641,6 +645,43 @@ extension Execution {
                     opcode = try doExecute(opcode, sp: &sp, pc: &pc, md: &md, ms: &ms)
                 }
             } catch let exception as WasmKitException {
+                try store.value.executionControl?.check()
+                if handleException(exception, sp: &sp, pc: &pc, md: &md, ms: &ms) {
+                    opcode = pc.read(OpcodeID.self)
+                    continue
+                }
+                throw exception
+            } catch let trap as Trap {
+                throw trap.withBacktrace(Self.captureBacktrace(sp: sp, store: store.value))
+            }
+        }
+    }
+
+    /// Polls between dispatch groups while keeping their remaining count local to this execution.
+    ///
+    /// - Parameters:
+    ///   - control: The store's immutable group policy and independently writable signal.
+    ///   - sp: The stack position maintained by guest calls and returns.
+    ///   - pc: The next instruction position maintained by dispatch and branches.
+    ///   - md: The cached base of the current guest linear memory.
+    ///   - ms: The cached size of the current guest linear memory.
+    /// - Throws: Requested termination, guest traps, or uncaught host and guest failures.
+    private mutating func runDispatchGroups(
+        control: ExecutionControl, sp: inout Sp, pc: inout Pc, md: inout Md, ms: inout Ms
+    ) throws {
+        var opcode = pc.read(OpcodeID.self)
+        while true {
+            do {
+                while true {
+                    try control.check()
+                    var remaining = control.pollingInterval
+                    repeat {
+                        opcode = try doExecute(opcode, sp: &sp, pc: &pc, md: &md, ms: &ms)
+                        remaining -= 1
+                    } while remaining != 0
+                }
+            } catch let exception as WasmKitException {
+                try control.check()
                 if handleException(exception, sp: &sp, pc: &pc, md: &md, ms: &ms) {
                     opcode = pc.read(OpcodeID.self)
                     continue
@@ -775,6 +816,7 @@ extension Execution {
             sp: sp
         )
         let results = try function.implementation(caller, Array(parameters))
+        try store.value.executionControl?.check()
         guard resolvedType.results.count == results.count else {
             throw Trap(.resultTypesMismatch(expected: resolvedType.results, got: results))
         }

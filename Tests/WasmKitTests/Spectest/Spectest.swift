@@ -103,7 +103,10 @@ struct SpectestRunner {
         }
     }
 
-    func run(test: TestCase, reporter: SpectestProgressReporter) throws {
+    func run(
+        test: TestCase, reporter: SpectestProgressReporter,
+        executionControl: ExecutionControl? = nil
+    ) throws {
         let logDuration: () -> Void
         if #available(macOS 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, *) {
             let start = ContinuousClock.now
@@ -117,7 +120,10 @@ struct SpectestRunner {
         }
         reporter.log("Testing  \(test.relativePath)")
         var failures = [(Location, reason: String)]()
-        try test.run(spectestModule: hostModule, configuration: configuration) { test, location, result in
+        try test.run(
+            spectestModule: hostModule, configuration: configuration,
+            executionControl: executionControl
+        ) { test, location, result in
             switch result {
             case .failed(let reason):
                 reporter.log("\(result.banner) \(reason)", path: test.path, location: location)
