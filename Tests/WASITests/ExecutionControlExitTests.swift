@@ -4,7 +4,7 @@ import WasmKitWASI
 
 @testable import WASI
 
-/// Host failure checks through the actual WASI command-start conversion boundary.
+/// Host completion checks through the actual WASI command-start conversion boundary.
 @Suite
 struct ExecutionControlExitTests {
     /// Keeps a native exit error from converting a requested interruption into successful startup.
@@ -41,6 +41,48 @@ struct ExecutionControlExitTests {
         let wasi = try WASIBridgeToHost()
         defer { try? wasi.close() }
         #expect(try wasi.start(instance) == 17)
+        #expect(control.termination == nil)
+    }
+
+    /// Preserves the requested stop when a host returns values outside its declared signature.
+    ///
+    /// - Parameters:
+    ///   - wrapped: Whether a WASM entrypoint calls the host import or directly reexports it.
+    ///   - reason: The permanent store termination requested before the invalid host return.
+    /// - Throws: Controller, fixture, or WASI provider setup failures.
+    @Test(arguments: [false, true], [ExecutionTermination.interrupted, .deadlineExceeded])
+    func interruptionWinsOverInvalidHostResults(wrapped: Bool, reason: ExecutionTermination) throws {
+        let control = try ExecutionControl()
+        let store = try Store(engine: Engine(configuration: EngineConfiguration(threadingModel: .token)), executionControl: control)
+        let instance = try entrypoint(store: store, wrapped: wrapped) { _, _ in
+            control.requestInterruption(reason: reason)
+            return [.i32(42)]
+        }
+        let wasi = try WASIBridgeToHost()
+        defer { try? wasi.close() }
+        #expect(throws: reason) { try wasi.start(instance) }
+        #expect(control.termination == reason)
+    }
+
+    /// Retains host result validation when the controlled store has no requested termination.
+    ///
+    /// - Parameter wrapped: Whether startup goes through a WASM caller before the host return.
+    /// - Throws: Controller, fixture, or WASI provider setup failures.
+    @Test(arguments: [false, true])
+    func liveInvalidHostResultsStillTrap(wrapped: Bool) throws {
+        let control = try ExecutionControl()
+        let store = try Store(engine: Engine(configuration: EngineConfiguration(threadingModel: .token)), executionControl: control)
+        let instance = try entrypoint(store: store, wrapped: wrapped) { _, _ in
+            [.i32(42)]
+        }
+        let wasi = try WASIBridgeToHost()
+        defer { try? wasi.close() }
+        #expect {
+            try wasi.start(instance)
+        } throws: { error in
+            guard let trap = error as? Trap else { return false }
+            return trap.reason.description.hasPrefix("result types don't match")
+        }
         #expect(control.termination == nil)
     }
 

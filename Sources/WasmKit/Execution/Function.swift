@@ -82,8 +82,9 @@ public struct Function: Equatable {
     /// Invokes the function synchronously on its owning store.
     ///
     /// A controlled store checks its permanent stop signal before invocation and successful
-    /// completion. If a host implementation throws after interruption was requested, the stop
-    /// reason takes precedence over that host error. Interruption cannot preempt native work.
+    /// completion. After a host implementation returns or throws, a requested stop takes
+    /// precedence over host errors and result validation failures. Interruption cannot preempt
+    /// native work.
     ///
     /// - Parameters:
     ///   - arguments: Values in the function signature's parameter order.
@@ -169,7 +170,7 @@ extension InternalFunction: ValidatableEntity {
 }
 
 extension InternalFunction {
-    /// Invokes an export while retaining store interruption checks across native host failures.
+    /// Invokes an export while checking native host completion before result validation.
     ///
     /// - Parameters:
     ///   - arguments: Values in the resolved function signature's parameter order.
@@ -200,6 +201,7 @@ extension InternalFunction {
                 try store.executionControl?.check()
                 throw error
             }
+            try store.executionControl?.check()
             try check(functionType: resolvedType, results: results)
         }
         try store.executionControl?.check()
