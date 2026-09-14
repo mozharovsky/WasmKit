@@ -82,7 +82,8 @@ public struct Function: Equatable {
     /// Invokes the function synchronously on its owning store.
     ///
     /// A controlled store checks its permanent stop signal before invocation and successful
-    /// completion. Interruption cannot preempt native work performed by a host function.
+    /// completion. If a host implementation throws after interruption was requested, the stop
+    /// reason takes precedence over that host error. Interruption cannot preempt native work.
     ///
     /// - Parameters:
     ///   - arguments: Values in the function signature's parameter order.
@@ -168,6 +169,13 @@ extension InternalFunction: ValidatableEntity {
 }
 
 extension InternalFunction {
+    /// Invokes an export while retaining store interruption checks across native host failures.
+    ///
+    /// - Parameters:
+    ///   - arguments: Values in the resolved function signature's parameter order.
+    ///   - store: The function's owning store, kept alive through every invocation boundary.
+    /// - Returns: The validated results while no requested termination prevents completion.
+    /// - Throws: Requested termination, a signature mismatch, or an ordinary guest or host failure.
     func invoke(_ arguments: [Value], store: Store) throws -> [Value] {
         try store.executionControl?.check()
         let results: [Value]
@@ -186,7 +194,12 @@ extension InternalFunction {
             let resolvedType = store.engine.resolveType(entity.type)
             try check(functionType: resolvedType, parameters: arguments)
             let caller = Caller(instanceHandle: nil, store: store)
-            results = try entity.implementation(caller, arguments)
+            do {
+                results = try entity.implementation(caller, arguments)
+            } catch {
+                try store.executionControl?.check()
+                throw error
+            }
             try check(functionType: resolvedType, results: results)
         }
         try store.executionControl?.check()
