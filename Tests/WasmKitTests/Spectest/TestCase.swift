@@ -123,7 +123,11 @@ class WastRunContext {
 }
 
 extension TestCase {
-    func run(spectestModule: Module, configuration: EngineConfiguration, handler: @escaping (TestCase, Location, Result) -> Void) throws {
+    func run(
+        spectestModule: Module, configuration: EngineConfiguration,
+        executionControl: ExecutionControl? = nil,
+        handler: @escaping (TestCase, Location, Result) -> Void
+    ) throws {
         guard let data = FileManager.default.contents(atPath: path) else {
             assertionFailure("failed to load \(path)")
             return
@@ -134,7 +138,12 @@ extension TestCase {
         configuration.features = features
 
         let engine = Engine(configuration: configuration)
-        let store = Store(engine: engine)
+        let store =
+            if let executionControl {
+                try Store(engine: engine, executionControl: executionControl)
+            } else {
+                Store(engine: engine)
+            }
         let spectestInstance = try spectestModule.instantiate(store: store)
 
         var content = try parseWAST(String(data: data, encoding: .utf8)!, features: features)

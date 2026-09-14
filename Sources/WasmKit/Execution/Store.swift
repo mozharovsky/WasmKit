@@ -18,6 +18,9 @@ public final class Store {
     /// The engine associated with this store.
     public let engine: Engine
 
+    /// The optional external stop signal fixed for this store's entire lifetime.
+    let executionControl: ExecutionControl?
+
     /// Parking lot for atomic wait/notify operations
     let atomicParkingLot = AtomicParkingLot()
 
@@ -25,6 +28,21 @@ public final class Store {
     public init(engine: Engine) {
         self.engine = engine
         self.allocator = StoreAllocator(funcTypeInterner: engine.funcTypeInterner)
+        self.executionControl = nil
+    }
+
+    /// Creates a token store whose controller remains reachable outside its busy executor.
+    ///
+    /// - Parameters:
+    ///   - engine: The engine configured for token threading.
+    ///   - executionControl: An unclaimed signal retained for this store's complete lifetime.
+    /// - Throws: Unsupported threading or a controller already claimed by another store.
+    public init(engine: Engine, executionControl: ExecutionControl) throws(ExecutionControlError) {
+        guard engine.configuration.threadingModel == .token else { throw .unsupportedThreadingModel }
+        try executionControl.claim()
+        self.engine = engine
+        self.allocator = StoreAllocator(funcTypeInterner: engine.funcTypeInterner)
+        self.executionControl = executionControl
     }
 }
 
