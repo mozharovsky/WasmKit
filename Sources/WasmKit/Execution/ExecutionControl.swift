@@ -11,6 +11,7 @@ public final class ExecutionControl: Sendable {
     ///
     /// This is an operation-count policy rather than a wall-clock bound. Export entry, completion,
     /// native import return, and caught guest exceptions also check the external signal.
+    /// A translated superinstruction can perform several WebAssembly operations in one dispatch.
     public let pollingInterval: UInt32
     /// Whether this controller records checkpoints for cross-thread progress diagnostics.
     private let recordsCheckpoints: Bool
@@ -19,7 +20,7 @@ public final class ExecutionControl: Sendable {
     /// Whether a store already claimed this controller, including a store that has been released.
     private let claimed = Atomic(false)
     /// Optional checkpoint counts without instruction-by-instruction instrumentation.
-    private let checkpoints = Atomic<UInt64>(0)
+    private let checkpoints = Atomic<UInt>(0)
 
     /// Creates a controller without allocating a timer or starting an execution.
     ///
@@ -55,9 +56,9 @@ public final class ExecutionControl: Sendable {
 
     /// The diagnostic checkpoint count, which stays zero when recording is disabled.
     ///
-    /// This includes entry and native-return checks and wraps after UInt64.max. It is not a count
+    /// This includes entry and native-return checks and wraps after UInt.max on the host. It is not a count
     /// of guest instructions and is not used to decide whether execution should terminate.
-    public var observedCheckpointCount: UInt64 { checkpoints.load(ordering: .relaxed) }
+    public var observedCheckpointCount: UInt64 { UInt64(checkpoints.load(ordering: .relaxed)) }
 
     /// Claims unique store ownership before any function can begin using this controller.
     ///
