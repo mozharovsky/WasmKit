@@ -24,17 +24,52 @@ public enum Event: Equatable, Sendable {
 
 /// A record of events that the worker, the main actor and the guest's host calls append to.
 public final class EventLog: Sendable {
-    private let events = Mutex<[Event]>([])
+    private struct State {
+        var events: [Event] = []
+        var watchers: [(event: Event, checkpoint: Checkpoint)] = []
+    }
+
+    private let state = Mutex(State())
 
     public init() {}
 
     /// Appends `event` after every event recorded before this call returned.
+    ///
+    /// Checkpoints that wait for this event open after it is appended.
     public func record(_ event: Event) {
-        events.withLock { $0.append(event) }
+        let reached = state.withLock { state in
+            state.events.append(event)
+            let reached = state.watchers.filter { $0.event == event }.map(\.checkpoint)
+            state.watchers.removeAll { $0.event == event }
+            return reached
+        }
+        for checkpoint in reached {
+            checkpoint.open()
+        }
+    }
+
+    /// Returns a checkpoint that opens once `event` has been recorded.
+    ///
+    /// The checkpoint is already open when the log contains `event`.
+    ///
+    /// - Parameter event: The event to wait for.
+    /// - Returns: The checkpoint, whose ``Checkpoint/wait()`` a caller can bound with
+    ///   ``withDeadline(_:_:)``.
+    public func checkpoint(for event: Event) -> Checkpoint {
+        let checkpoint = Checkpoint()
+        let alreadyRecorded = state.withLock { state in
+            if state.events.contains(event) { return true }
+            state.watchers.append((event, checkpoint))
+            return false
+        }
+        if alreadyRecorded {
+            checkpoint.open()
+        }
+        return checkpoint
     }
 
     /// The events recorded so far.
     public var snapshot: [Event] {
-        events.withLock { $0 }
+        state.withLock { $0.events }
     }
 }

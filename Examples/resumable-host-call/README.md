@@ -9,7 +9,9 @@ same invocation with the reading through `SuspendedCall.resume(returning:complet
 The worker keeps at most one paused invocation, because a guest compiled from Swift keeps a
 shadow stack in its linear memory. Cancelling a paused invocation releases it. A reading that
 arrives afterwards is refused, either by the worker or by WasmKit when another invocation has
-paused in the meantime.
+paused in the meantime. When the evaluating task is cancelled, the worker checks for that before
+it continues the guest, so a reading that returns faster than the cancellation handler is refused
+too. Cancellation is cooperative and does not undo a measurement that already ran.
 
 ## Building the guest
 
@@ -61,6 +63,19 @@ late reading: refused(WasmKit.ResumeRejection.staleSuspension)
   ...
   14. finished(result: 214)
 next invocation result 214, native reference 214
+```
+
+The third part cancels the evaluating task inside the measurement, just before the reading
+returns. The worker refuses the reading and the guest's step count stays the same.
+
+```text
+3. A task cancelled just before a fast reading returns does not continue the guest
+cancelled evaluation: cancelled
+  ...
+  4. measured(input: 10, reading: 107)
+  5. cancelled(input: 10)
+  6. refusedLateReading(reading: 107)
+guest completed steps 4 before and 4 after, still paused: false
 ```
 
 The tests run each scenario under both dispatch models and bound every wait with a deadline.

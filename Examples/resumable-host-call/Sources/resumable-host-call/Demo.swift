@@ -12,6 +12,8 @@ final class WorkerReference {
     var worker: GuestWorker?
     /// A checkpoint that the next measurement waits for before it answers.
     var holdNextMeasurement: (entered: Checkpoint, release: Checkpoint)?
+    /// Whether a measurement cancels the evaluation that awaits it just before it returns.
+    var cancelsBeforeReturning = false
 }
 
 @main
@@ -27,7 +29,7 @@ struct Demo {
             if let hold = reference.holdNextMeasurement {
                 reference.holdNextMeasurement = nil
                 hold.entered.open()
-                try? await hold.release.wait()
+                await hold.release.waitIgnoringCancellation()
             }
             // The worker waits for this closure without blocking, so it can answer here.
             if let worker = reference.worker {
@@ -35,6 +37,9 @@ struct Demo {
             }
             let reading = instrument.measure(input)
             log.record(.measured(input: input, reading: reading))
+            if reference.cancelsBeforeReturning {
+                withUnsafeCurrentTask { $0?.cancel() }
+            }
             return reading
         }
         reference.worker = worker
@@ -68,6 +73,22 @@ struct Demo {
         print(describe(Array(log.snapshot[before...])))
         print("next invocation result \(nextResult), native reference \(referenceEvaluation(1))")
         print("guest completed steps \(try await worker.completedSteps()), main actor measured \(instrument.measuredInputs)")
+
+        print("\n3. A task cancelled just before a fast reading returns does not continue the guest")
+        reference.cancelsBeforeReturning = true
+        let start = log.snapshot.count
+        let stepsBefore = try await worker.completedSteps()
+        let interrupted = Task { try await worker.evaluate(1) }
+        do {
+            _ = try await withDeadline { try await interrupted.value }
+            print("the cancelled evaluation finished, which is wrong")
+        } catch {
+            print("cancelled evaluation: \(error)")
+        }
+        reference.cancelsBeforeReturning = false
+        print(describe(Array(log.snapshot[start...])))
+        let stepsAfter = try await worker.completedSteps()
+        print("guest completed steps \(stepsBefore) before and \(stepsAfter) after, still paused: \(await worker.cancelPausedInvocation())")
     }
 
     static func describe(_ events: [Event]) -> String {

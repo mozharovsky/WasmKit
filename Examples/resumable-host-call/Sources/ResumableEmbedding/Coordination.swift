@@ -24,15 +24,30 @@ public final class Checkpoint: Sendable {
         }
     }
 
+    /// Waits until the checkpoint opens, even when the waiting task is cancelled.
+    ///
+    /// It stands for native work that runs to its end once it started. A caller that must not
+    /// hang bounds the surrounding work with ``withDeadline(_:_:)`` and opens the checkpoint.
+    public func waitIgnoringCancellation() async {
+        let id = nextWaiter()
+        try? await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            let isOpen = state.withLock { state in
+                if state.isOpen { return true }
+                state.waiters[id] = continuation
+                return false
+            }
+            if isOpen {
+                continuation.resume()
+            }
+        }
+    }
+
     /// Waits until the checkpoint opens.
     ///
     /// - Throws: `CancellationError` when the waiting task is cancelled before the checkpoint
     ///   opens.
     public func wait() async throws {
-        let id = state.withLock { state in
-            state.lastWaiter += 1
-            return state.lastWaiter
-        }
+        let id = nextWaiter()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
                 let outcome: Result<Void, any Error>? = state.withLock { state in
@@ -48,6 +63,13 @@ public final class Checkpoint: Sendable {
         } onCancel: {
             let waiter = state.withLock { $0.waiters.removeValue(forKey: id) }
             waiter?.resume(throwing: CancellationError())
+        }
+    }
+
+    private func nextWaiter() -> Int {
+        state.withLock { state in
+            state.lastWaiter += 1
+            return state.lastWaiter
         }
     }
 }

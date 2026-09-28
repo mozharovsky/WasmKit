@@ -93,14 +93,19 @@ public actor GuestWorker {
     /// Runs the guest's `evaluate(count)` and returns its result.
     ///
     /// Each `measure` call in the guest pauses the invocation until the main actor returns a
-    /// reading. Other messages to the worker run during that wait. Cancelling the calling task
-    /// releases the paused invocation, and the reading that arrives afterwards is refused.
+    /// reading. Other messages to the worker run during that wait.
+    ///
+    /// Cancelling the calling task while the invocation is paused releases that pause, and the
+    /// guest does not continue, even when the reading arrives before the worker has handled the
+    /// cancellation. Cancellation is cooperative. The worker observes it only while the guest is
+    /// paused, a measurement that already started runs to its end, and its effects remain.
     ///
     /// - Parameter count: The number of steps, and so of pauses, in the guest.
     /// - Returns: The guest's result.
     /// - Throws: ``Failure/busy`` when another invocation is paused, ``Failure/cancelled`` when
-    ///   the invocation was released during its wait, ``Failure/refused(_:)`` when WasmKit
-    ///   refused its reading, and the guest's trap if it traps.
+    ///   the calling task was cancelled or the invocation was released during its wait,
+    ///   ``Failure/refused(_:)`` when WasmKit refused its reading, and the guest's trap if it
+    ///   traps.
     public func evaluate(_ count: Int32) async throws -> Int32 {
         guard paused == nil else { throw Failure.busy }
         log.record(.started(count: count))
@@ -112,6 +117,14 @@ public actor GuestWorker {
                 await measure(input)
             } onCancel: {
                 Task { await self.cancel(id) }
+            }
+            // The handler's task can reach the worker after a fast measurement has returned, so
+            // the worker checks the cancellation itself before the guest would continue. It
+            // releases only this evaluation's pause, which leaves a successor's pause alone.
+            if Task.isCancelled {
+                cancel(id)
+                log.record(.refusedLateReading(reading: reading))
+                throw Failure.cancelled
             }
             progress = try deliver(reading, to: id)
         }
