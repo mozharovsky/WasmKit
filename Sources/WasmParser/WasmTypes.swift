@@ -13,17 +13,24 @@ public struct Code: Sendable {
     @usableFromInline
     internal let offset: Int
     @usableFromInline
+    internal let bodyOffset: Int
+    @usableFromInline
     internal let features: WasmFeatureSet
 
     #if WasmDebuggingSupport
         package var originalAddress: Int { self.offset }
+
+        /// Start of the function body (locals declaration). DWARF's `DW_AT_low_pc` typically
+        /// points here.
+        package var originalBodyAddress: Int { self.bodyOffset }
     #endif
 
     @inlinable
-    init(locals: [ValueType], expression: ArraySlice<UInt8>, offset: Int, features: WasmFeatureSet) {
+    init(locals: [ValueType], expression: ArraySlice<UInt8>, offset: Int, bodyOffset: Int, features: WasmFeatureSet) {
         self.locals = locals
         self.expression = expression
         self.offset = offset
+        self.bodyOffset = bodyOffset
         self.features = features
     }
 }
@@ -170,9 +177,13 @@ public typealias ConstExpression = [Instruction]
 /// <https://webassembly.github.io/spec/core/syntax/modules.html#tables>
 public struct Table: Equatable, Sendable {
     public let type: TableType
+    /// The value every element starts with, or `nil` for null. Only tables of
+    /// the typed function references proposal have one.
+    public let initializer: ConstExpression?
 
-    public init(type: TableType) {
+    public init(type: TableType, initializer: ConstExpression? = nil) {
         self.type = type
+        self.initializer = initializer
     }
 }
 
@@ -193,7 +204,7 @@ public struct Global: Equatable, Sendable {
 /// Tag entry in a module
 /// > Note:
 /// <https://webassembly.github.io/exception-handling/core/syntax/modules.html#tags>
-public struct Tag: Equatable {
+public struct Tag: Equatable, Sendable {
     /// The type index of the tag's function type (parameters = exception payload, results must be empty).
     public let type: TypeIndex
 
@@ -482,5 +493,36 @@ extension Instruction.Store {
         case .i64Store16, .i64AtomicStore16: return .i64
         case .i64Store32, .i64AtomicStore32: return .i64
         }
+    }
+}
+
+extension Limits: CustomStringConvertible {
+    public var description: String {
+        var result = "min: \(min)"
+        if let max = max { result += ", max: \(max)" }
+        if shared { result += ", shared" }
+        if isMemory64 { result += ", memory64" }
+        return result
+    }
+}
+
+extension TableType: CustomStringConvertible {
+    public var description: String {
+        "\(elementType) (\(limits))"
+    }
+}
+
+extension Mutability: CustomStringConvertible {
+    public var description: String {
+        switch self {
+        case .constant: return "const"
+        case .variable: return "var"
+        }
+    }
+}
+
+extension GlobalType: CustomStringConvertible {
+    public var description: String {
+        "\(mutability) \(valueType)"
     }
 }

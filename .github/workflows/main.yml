@@ -11,6 +11,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  # Package.swift promotes warnings to errors only when this is set, so dependents never inherit it.
+  WASMKIT_WARNINGS_AS_ERRORS: "1"
   # Shared dev snapshot; bump these two to refresh every dev-snapshot download below.
   DEV_SNAPSHOT: swift-DEVELOPMENT-SNAPSHOT-2026-06-12-a
   WASI_SDK_CHECKSUM: "72eeab944b2ac44536aaaea2c5dc75fb30a0aa469f9ce59f831e08d2a8e60c48"
@@ -46,7 +48,8 @@ jobs:
       - uses: actions/checkout@v6
       - id: setup-development
         run: |
-          brew install wabt jemalloc
+          brew install jemalloc
+          ./CI/install-wabt.sh
           curl -O https://download.swift.org/swiftly/darwin/swiftly.pkg && \
             installer -pkg swiftly.pkg -target CurrentUserHomeDirectory
 
@@ -58,11 +61,11 @@ jobs:
           swiftly install ${{ matrix.toolchain }}
           swiftly use ${{ matrix.toolchain }}
 
-          ./Vendor/checkout-dependency --category benchmark --category component-model
+          ./Vendor/checkout-dependency --category component-model
 
           swift --version
-          swift test --sanitize address --traits ComponentModel,WasmDebuggingSupport ${{ matrix.test-args }}
-          cd Benchmarks && swift package benchmark
+          swift test --sanitize address --traits FileSystem,MultiThread,ComponentModel,WasmDebuggingSupport,Disassembler ${{ matrix.test-args }}
+          swift build --package-path Benchmarks
 
   build-macos:
     strategy:
@@ -71,7 +74,7 @@ jobs:
           # Swift 6.3.2
           - os: macos-26
             xcode: Xcode_26.5
-            test-args: "--sanitize address --traits ComponentModel,WasmDebuggingSupport"
+            test-args: "--sanitize address --traits FileSystem,MultiThread,ComponentModel,WasmDebuggingSupport,Disassembler"
 
     runs-on: ${{ matrix.os }}
     name: "build-macos (${{ matrix.xcode }})"
@@ -103,6 +106,17 @@ jobs:
           EOS
       - run: ./Vendor/checkout-dependency --category default --category component-model
       - run: swift test ${{ matrix.test-args }}
+      - name: Build & smoke-test embedded-wat example with Embedded Swift
+        run: |
+          swift_bin="${{ steps.setup-development.outputs.toolchain-path }}/usr/bin/swift"
+          embedded_lib_dir="${{ steps.setup-development.outputs.toolchain-path }}/usr/lib/swift/embedded/$(uname -m)-apple-macos"
+          unicode_lib=$(find "$embedded_lib_dir" -name libswiftUnicodeDataTables.a | head -1)
+          test -n "$unicode_lib" || { echo "::error::libswiftUnicodeDataTables.a not found under $embedded_lib_dir"; exit 1; }
+          out=$(printf '%s' '(module (func (result f64) (f64.const 3.14)))' | \
+            "$swift_bin" run --package-path Examples/embedded-wat \
+              -Xswiftc -enable-experimental-feature -Xswiftc Embedded -Xlinker "$unicode_lib")
+          echo "$out" | tr '\n' ' ' | grep -qF '0x44 0x1f 0x85 0xeb 0x51 0xb8 0x1e 0x9 0x40' \
+            || { echo "::error::embedded-wat smoke test produced wrong output"; echo "$out"; exit 1; }
 
   build-xcode:
     runs-on: macos-26
@@ -132,14 +146,15 @@ jobs:
       matrix:
         include:
           - swift: "swift:6.3-noble"
-            test-args: "--traits ComponentModel,WasmDebuggingSupport --enable-code-coverage"
+            test-args: "--traits FileSystem,MultiThread,ComponentModel,WasmDebuggingSupport,Disassembler --enable-code-coverage"
             build-benchmarks: true
+            run-benchmarks: true
             build-dev-dashboard: true
           - swift: "swiftlang/swift:nightly-6.4.x-noble"
-            test-args: "--traits ComponentModel,WasmDebuggingSupport"
+            test-args: "--traits FileSystem,MultiThread,ComponentModel,WasmDebuggingSupport,Disassembler"
             build-benchmarks: true
           - swift: "swiftlang/swift:nightly-main-noble"
-            test-args: "--traits ComponentModel,WasmDebuggingSupport"
+            test-args: "--traits FileSystem,MultiThread,ComponentModel,WasmDebuggingSupport,Disassembler"
             build-benchmarks: true
 
     runs-on: ubuntu-24.04
@@ -177,11 +192,16 @@ jobs:
       - run: ./Vendor/checkout-dependency --category benchmark --category component-model
       - run: ./build-exec swift test ${{ matrix.test-args }}
 
-      - if: matrix.build-benchmarks
+      - if: ${{ matrix.build-benchmarks && !matrix.run-benchmarks }}
+        name: Build benchmark targets
+        run: ./build-exec swift build --build-system native --package-path Benchmarks
+
+      - if: matrix.run-benchmarks
+        name: Smoke benchmark runner
         run: |
           ./build-exec apt-get update
           ./build-exec apt-get install -y libjemalloc-dev
-          ./build-exec swift package --build-system native --package-path Benchmarks benchmark
+          ./build-exec swift package --package-path Benchmarks benchmark
 
       - if: matrix.build-dev-dashboard
         run: ./build-exec ./CI/build-dev-dashboard.sh
@@ -214,8 +234,8 @@ jobs:
       matrix:
         include:
           - swift: 6.3-noble
-            musl-swift-sdk-download: "https://download.swift.org/swift-6.3.2-release/static-sdk/swift-6.3.2-RELEASE/swift-6.3.2-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz"
-            musl-swift-sdk-checksum: "3fd798bef6f4408f1ea5a6f94ce4d4052830c4326ab85ebc04f983f01b3da407"
+            musl-swift-sdk-download: "https://download.swift.org/swift-6.3.3-release/static-sdk/swift-6.3.3-RELEASE/swift-6.3.3-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz"
+            musl-swift-sdk-checksum: 87c3eaf908e67c0e13a84367119e12273cec1d2cd3d81f7d74bb36722d6b607b
     steps:
       - uses: actions/checkout@v6
       - name: Configure container
@@ -228,13 +248,15 @@ jobs:
         run: ./build-exec swift sdk install "${{ matrix.musl-swift-sdk-download }}" --checksum "${{ matrix.musl-swift-sdk-checksum }}"
 
       - name: Build (x86_64-swift-linux-musl)
-        run: ./build-exec swift build --swift-sdk x86_64-swift-linux-musl --traits ComponentModel,WasmDebuggingSupport --explicit-target-dependency-import-check error
+        run: ./build-exec swift build --swift-sdk x86_64-swift-linux-musl --traits FileSystem,MultiThread,ComponentModel,WasmDebuggingSupport,Disassembler --explicit-target-dependency-import-check error
       - name: Build (aarch64-swift-linux-musl)
-        run: ./build-exec swift build --swift-sdk aarch64-swift-linux-musl --traits ComponentModel,WasmDebuggingSupport --explicit-target-dependency-import-check error
+        run: ./build-exec swift build --swift-sdk aarch64-swift-linux-musl --traits FileSystem,MultiThread,ComponentModel,WasmDebuggingSupport,Disassembler --explicit-target-dependency-import-check error
 
   build-android:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # Enough headroom for a cold run: a cache miss has to create the AVD and
+    # boot the emulator twice before any test runs.
+    timeout-minutes: 25
     strategy:
       matrix:
         include:
@@ -250,6 +272,11 @@ jobs:
         with:
           android-api-level: 30
           swift-version: "${{ matrix.swift-version }}"
+          # Cold boot instead of loading the quick-boot snapshot kept in the AVD cache. The snapshot is saved on
+          # whichever runner populated the cache, and restoring it on a host with a different CPU vendor kills
+          # system_server, so the action's `adb shell input keyevent 82` fails with "No service published for:
+          # input" or DeadSystemException before any test runs.
+          android-emulator-options: -no-snapshot -no-window -noaudio -no-boot-anim
 
   build-windows:
     runs-on: windows-latest
@@ -280,15 +307,54 @@ jobs:
       - run: cmake --build ./build
       - run: ./build/bin/wasmkit --version
 
+  build-embedded:
+    runs-on: ubuntu-24.04
+    container:
+      image: swiftlang/swift:nightly-main-noble
+    steps:
+      - uses: actions/checkout@v6
+      - run: ./Utilities/build-embedded.sh
+
+  smoke-esp32:
+    runs-on: ubuntu-24.04
+    container:
+      image: espressif/idf:v5.5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Swift development snapshot
+        run: |
+          apt-get update && apt-get install -y libcurl4 libedit2 libxml2 libsqlite3-0 libz3-4 zlib1g libncurses6
+          dir=$(curl -sSL https://download.swift.org/development/ubuntu2204/latest-build.yml | sed -n 's/^dir: //p')
+          download=$(curl -sSL https://download.swift.org/development/ubuntu2204/latest-build.yml | sed -n 's/^download: //p')
+          mkdir -p /opt/swift
+          curl -sSL "https://download.swift.org/development/ubuntu2204/$dir/$download" \
+            | tar xz -C /opt/swift --strip-components 1
+      - name: Install QEMU
+        run: |
+          apt-get install -y libpixman-1-0 libglib2.0-0 libgcrypt20 libslirp0
+          python $IDF_PATH/tools/idf_tools.py install qemu-riscv32
+      - name: Run ESP32 smoke test in QEMU
+        run: SWIFT_TOOLCHAIN=/opt/swift ./Examples/embedded-esp32/smoke-test.sh --qemu
+
   build-wasi:
     runs-on: ubuntu-24.04
     container:
-      image: swift:6.3.2-noble
+      image: swift:6.3-noble
     steps:
       - uses: actions/checkout@v6
       - name: Install jq
         run: apt-get update && apt-get install -y jq
       - name: Install Swift SDK
-        run: swift sdk install https://download.swift.org/swift-6.3.2-release/wasm-sdk/swift-6.3.2-RELEASE/swift-6.3.2-RELEASE_wasm.artifactbundle.tar.gz --checksum a61f0584c93283589f8b2f42db05c1f9a182b506c2957271402992655591dd7c
+        run: swift sdk install https://download.swift.org/swift-6.3.3-release/wasm-sdk/swift-6.3.3-RELEASE/swift-6.3.3-RELEASE_wasm.artifactbundle.tar.gz --checksum cabfa08b73bb8ac783927ecd15fa386e99d0c139c5f232445067bcf58379cae7
       - name: Build with the Swift SDK
-        run: swift build --swift-sdk "$(swiftc -print-target-info | jq -r '.swiftCompilerTag')_wasm" --traits ComponentModel --explicit-target-dependency-import-check error --product wasmkit-cli
+        run: swift build --swift-sdk "$(swiftc -print-target-info | jq -r '.swiftCompilerTag')_wasm" --traits FileSystem,ComponentModel,Disassembler --explicit-target-dependency-import-check error --product wasmkit-cli
+      - name: Build & smoke-test embedded-wat example with Embedded Swift
+        run: |
+          sdk="$(swiftc -print-target-info | jq -r '.swiftCompilerTag')_wasm-embedded"
+          swift_resources=$(swift sdk configure --show-configuration "$sdk" wasm32-unknown-wasip1 | sed -n 's/^swiftResourcesPath: *//p')
+          unicode_lib="$swift_resources/embedded/wasm32-unknown-wasip1/libswiftUnicodeDataTables.a"
+          test -f "$unicode_lib" || { echo "::error::libswiftUnicodeDataTables.a not found at $unicode_lib"; exit 1; }
+          out=$(printf '%s' '(module (func (result f64) (f64.const 3.14)))' | \
+            swift run --package-path Examples/embedded-wat --swift-sdk "$sdk" -Xlinker "$unicode_lib")
+          echo "$out" | tr '\n' ' ' | grep -qF '0x44 0x1f 0x85 0xeb 0x51 0xb8 0x1e 0x9 0x40' \
+            || { echo "::error::embedded-wat smoke test produced wrong output"; echo "$out"; exit 1; }

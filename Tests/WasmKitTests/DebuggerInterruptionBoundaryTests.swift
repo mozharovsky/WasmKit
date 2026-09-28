@@ -7,6 +7,59 @@
     /// Completion checks for debugger entry and resume paths that bypass Function.invoke.
     @Suite
     struct DebuggerInterruptionBoundaryTests {
+        /// Rejects a stopped debugger before it invokes an entrypoint backed by native code.
+        ///
+        /// - Throws: Fixture construction, debugger setup, or an unexpected execution failure.
+        @Test
+        func stoppedDebuggerDoesNotEnterHostExport() throws {
+            let control = try ExecutionControl()
+            let store = try Store(engine: Engine(configuration: EngineConfiguration(threadingModel: .token)), executionControl: control)
+            var hostEntries = 0
+            var imports = Imports()
+            imports.define(
+                module: "host", name: "start",
+                Function(store: store, parameters: []) { _, _ in
+                    hostEntries += 1
+                    return []
+                })
+            let module = try parseWasm(bytes: wat2wasm("(module (import \"host\" \"start\" (func $start)) (export \"_start\" (func $start)))"))
+            var debugger = try Debugger(module: module, store: store, imports: imports)
+            control.requestInterruption()
+            do {
+                try debugger.run()
+                Issue.record("The stopped debugger entered its native export.")
+            } catch let reason as ExecutionTermination {
+                #expect(reason == .interrupted)
+            }
+            #expect(hostEntries == 0)
+        }
+
+        /// Keeps an armed breakpoint intact when termination rejects a pending resume.
+        ///
+        /// - Throws: Fixture construction, debugger setup, or an unexpected execution failure.
+        @Test
+        func stoppedDebuggerKeepsItsBreakpoint() throws {
+            let control = try ExecutionControl()
+            let store = try Store(engine: Engine(configuration: EngineConfiguration(threadingModel: .token)), executionControl: control)
+            let module = try parseWasm(bytes: wat2wasm("(module (func (export \"_start\")))"))
+            var debugger = try Debugger(module: module, store: store, imports: [:])
+            try debugger.stopAtEntrypoint()
+            try debugger.run()
+            guard case .stoppedAtBreakpoint = debugger.state else {
+                Issue.record("The debugger did not stop at its entrypoint.")
+                return
+            }
+            let armed = debugger.armedBreakpointAddresses
+            control.requestInterruption()
+            do {
+                try debugger.run()
+                Issue.record("The stopped debugger resumed guest execution.")
+            } catch let reason as ExecutionTermination {
+                #expect(reason == .interrupted)
+            }
+            #expect(debugger.armedBreakpointAddresses == armed)
+        }
+
         /// Observes interruption requested in the final dispatch group before debugger success.
         ///
         /// - Parameters:

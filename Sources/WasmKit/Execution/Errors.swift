@@ -18,13 +18,13 @@ public struct Backtrace: CustomStringConvertible, Sendable {
     public var description: String {
         symbols.enumerated().map { (index, symbol) in
             let name = symbol.name ?? "unknown"
-            return "    \(index): (\(symbol.address)) \(name)"
+            return "    \(index): (0x\(String(UInt(bitPattern: symbol.address), radix: 16))) \(name)"
         }.joined(separator: "\n")
     }
 }
 
 /// An error that occurs during execution of a WebAssembly module.
-public struct Trap: Error, CustomStringConvertible {
+public struct Trap: Error, CustomStringConvertible, Sendable {
     /// The reason for the trap.
     package private(set) var reason: TrapReason
 
@@ -70,7 +70,7 @@ public struct WasmKitException: Error, CustomStringConvertible {
     }
 
     public var description: String {
-        "wasm exception (payload: \(payload))"
+        "wasm exception (payload: [\(Value.descriptionList(payload))])"
     }
 
     /// Returns true if this exception's tag matches the given tag handle.
@@ -80,8 +80,8 @@ public struct WasmKitException: Error, CustomStringConvertible {
 }
 
 /// A reason for a trap that occurred during execution of a WebAssembly module.
-package enum TrapReason: Error, CustomStringConvertible {
-    package struct Message {
+package enum TrapReason: Error, CustomStringConvertible, Sendable {
+    package struct Message: Sendable {
         let text: String
 
         init(_ text: String) {
@@ -112,6 +112,12 @@ package enum TrapReason: Error, CustomStringConvertible {
     case integerOverflow
     /// Invalid conversion to integer
     case invalidConversionToInteger
+    /// Execution consumed all of the fuel budgeted by ``Store/fuel``
+    case outOfFuel
+    /// `call_ref` or `return_call_ref` called a null function reference.
+    case nullFunctionReference
+    /// `ref.as_non_null` was given a null reference.
+    case nullReference
 
     /// The description of the trap reason.
     package var description: String {
@@ -132,6 +138,12 @@ package enum TrapReason: Error, CustomStringConvertible {
             return "integer overflow"
         case .invalidConversionToInteger:
             return "invalid conversion to integer"
+        case .outOfFuel:
+            return "out of fuel"
+        case .nullFunctionReference:
+            return "null function reference"
+        case .nullReference:
+            return "null reference"
         case .indirectCallToNull(let elementIndex):
             return "indirect call to null element (uninitialized element \(elementIndex))"
         case .typeMismatchCall(let actual, let expected):
@@ -150,42 +162,37 @@ extension TrapReason.Message {
         Self("initial memory size exceeds the resource limit: \(byteSize) bytes")
     }
     static func parameterTypesMismatch(expected: [ValueType], got: [Value]) -> Self {
-        Self("parameter types don't match, expected \(expected), got \(got)")
+        Self("parameter types don't match, expected [\(ValueType.descriptionList(expected))], got [\(Value.descriptionList(got))]")
     }
     static func resultTypesMismatch(expected: [ValueType], got: [Value]) -> Self {
-        Self("result types don't match, expected \(expected), got \(got)")
+        Self("result types don't match, expected [\(ValueType.descriptionList(expected))], got [\(Value.descriptionList(got))]")
     }
     static var cannotAssignToImmutableGlobal: Self {
         Self("cannot assign to an immutable global")
     }
+    static func mmapFailed(reserveBytes: Int) -> Self {
+        Self("failed to reserve \(reserveBytes) bytes of virtual address space for shared memory")
+    }
+    static var sharedMemoryRequiresMprotect: Self {
+        Self("shared memory requires mprotect-based bounds checking, which is unavailable in this configuration")
+    }
+    static var atomicWaitOnUnsharedMemory: Self {
+        Self("`memory.atomic.wait` requires a shared memory")
+    }
     static func noGlobalExportWithName(globalName: String, instance: Instance) -> Self {
-        Self("no global export with name \(globalName) in a module instance \(instance)")
+        Self("no global export with name \(globalName) in a module instance")
     }
     static func exportedFunctionNotFound(name: String, instance: Instance) -> Self {
-        Self("exported function \(name) not found in instance \(instance)")
+        Self("exported function \(name) not found in instance")
     }
     static func unimplemented(feature: String) -> Self {
         Self("\(feature) is not implemented yet")
     }
 }
 
-package struct ImportError: Error {
-    package struct Message {
-        package let text: String
-
-        init(_ text: String) {
-            self.text = text
-        }
-    }
-
-    package let message: Message
-
-    init(_ message: Message) {
-        self.message = message
-    }
-}
-
-extension ImportError.Message {
+// Import-resolution failures raised during instantiation and module
+// registration.
+extension WasmKitError.Message {
     static func missing(moduleName: String, externalName: String) -> Self {
         Self("unknown import \(moduleName).\(externalName)")
     }

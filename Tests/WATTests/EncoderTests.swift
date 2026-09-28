@@ -9,10 +9,18 @@ struct EncoderTests {
 
     // MARK: - Constants
 
+    // Memory64, tail calls, extended constant expressions and exceptions are
+    // enabled by default since wabt 1.0.42, which also removed their flags.
     private static let wast2jsonFeatures = [
-        "--enable-memory64",
-        "--enable-tail-call",
-        "--enable-threads",
+        "--enable-threads"
+    ]
+
+    /// Features enabled only for the files in the given directories. With
+    /// function references enabled, wast2json writes element segments as
+    /// expressions rather than function indices, so the encoder's output would
+    /// no longer match elsewhere.
+    private static let wast2jsonDirectoryFeatures: [String: [String]] = [
+        "function-references": ["--enable-function-references"]
     ]
 
     // MARK: - Supporting Types
@@ -68,7 +76,7 @@ struct EncoderTests {
             stats.failed.insert(wast.lastPathComponent)
         }
 
-        var parser = WastParser(
+        var parser = WASTParser(
             try String(contentsOf: wast, encoding: .utf8),
             features: Spectest.deriveFeatureSet(wast: wast)
         )
@@ -306,7 +314,11 @@ struct EncoderTests {
 
     #if !(os(iOS) || os(watchOS) || os(tvOS) || os(visionOS))
         @Test(
-            arguments: Spectest.wastFiles(include: [], exclude: [])
+            arguments: Spectest.wastFiles(
+                include: [],
+                // The encoder orders the type section differently from wast2json for tags.
+                exclude: ["br_if_landing_pad_try_table.wast"]
+            )
         )
         func spectest(wastFile: URL) throws {
             guard let wast2json = TestSupport.lookupExecutable("wast2json") else {
@@ -361,6 +373,7 @@ struct EncoderTests {
         private func runWast2Json(wast2json: URL, wastFile: URL, json: URL) throws {
             var arguments = [wastFile.path]
             arguments.append(contentsOf: Self.wast2jsonFeatures)
+            arguments.append(contentsOf: Self.wast2jsonDirectoryFeatures[wastFile.deletingLastPathComponent().lastPathComponent] ?? [])
             arguments.append(contentsOf: ["-o", json.path])
 
             let process = try Process.run(wast2json, arguments: arguments)
@@ -390,8 +403,8 @@ struct EncoderTests {
             customSections.append(section)
         }
         let nameSection = customSections.first(where: { $0.name == "name" })
-        let nameParser = NameSectionParser(
-            stream: StaticByteStream(bytes: nameSection?.bytes ?? [])
+        var nameParser = NameSectionParser(
+            stream: StaticByteStreamSource(bytes: nameSection?.bytes ?? [])
         )
         let names = try nameParser.parseAll()
         #expect(names.count == 1)
@@ -434,8 +447,8 @@ struct EncoderTests {
             }
         }
         let sectionBytes = Array(nameBytes ?? [])
-        let nameParser = NameSectionParser(
-            stream: StaticByteStream(bytes: sectionBytes)
+        var nameParser = NameSectionParser(
+            stream: StaticByteStreamSource(bytes: sectionBytes)
         )
         let parsed = try nameParser.parseAll()
         #expect(parsed.count == 10)

@@ -1,55 +1,28 @@
-import SystemExtras
-import SystemPackage
 import WasmParser
-
-#if os(Windows)
-    import ucrt
-#endif
-
-/// Parse a given file as a WebAssembly binary format file
-/// > Note: <https://webassembly.github.io/spec/core/binary/index.html>
-public func parseWasm(filePath: FilePath, features: WasmFeatureSet = .default) throws -> Module {
-    #if os(Windows)
-        // TODO: Upstream `O_BINARY` to `SystemPackage
-        let accessMode = FileDescriptor.AccessMode(
-            rawValue: FileDescriptor.AccessMode.readOnly.rawValue | O_BINARY
-        )
-    #else
-        let accessMode: FileDescriptor.AccessMode = .readOnly
-    #endif
-    let fileHandle = try FileDescriptor.open(filePath, accessMode)
-    return try withThrowing {
-        let stream = try FileHandleStream(fileHandle: fileHandle)
-        let module = try parseModule(stream: stream, features: features)
-        return module
-    } defer: {
-        try fileHandle.close()
-    }
-}
 
 /// Parse a given byte array as a WebAssembly binary format file
 /// > Note: <https://webassembly.github.io/spec/core/binary/index.html>
 public func parseWasm(bytes: [UInt8], features: WasmFeatureSet = .default) throws(WasmKitError) -> Module {
-    let stream = StaticByteStream(bytes: bytes)
-    let module = try parseModule(stream: stream, features: features)
+    let parser = Parser(bytes: bytes, features: features)
+    let module = try parseModule(parser: parser, features: features)
     return module
 }
 
 /// Parse a given byte slice as a WebAssembly binary format file
 /// > Note: <https://webassembly.github.io/spec/core/binary/index.html>
 public func parseWasm(bytes: ArraySlice<UInt8>, features: WasmFeatureSet = .default) throws -> Module {
-    let stream = StaticByteStream(bytes: bytes)
-    let module = try parseModule(stream: stream, features: features)
+    let parser = Parser(bytes: bytes, features: features)
+    let module = try parseModule(parser: parser, features: features)
     return module
 }
 
 /// > Note:
 /// <https://webassembly.github.io/spec/core/binary/modules.html#binary-module>
-func parseModule<Stream: ByteStream>(stream: Stream, features: WasmFeatureSet = .default) throws(WasmKitError) -> Module {
+func parseModule<Source: ByteStreamSource>(parser: consuming WasmParser.Parser<Source>, features: WasmFeatureSet = .default) throws(WasmKitError) -> Module {
     var types: [FunctionType] = []
     var typeIndices: [TypeIndex] = []
     var codes: [Code] = []
-    var tables: [TableType] = []
+    var tables: [WasmParser.Table] = []
     var memories: [MemoryType] = []
     var globals: [WasmParser.Global] = []
     var tags: [WasmParser.Tag] = []
@@ -60,10 +33,6 @@ func parseModule<Stream: ByteStream>(stream: Stream, features: WasmFeatureSet = 
     var exports: [Export] = []
     var customSections: [CustomSection] = []
     var dataCount: UInt32?
-
-    var parser = WasmParser.Parser<Stream>(
-        stream: stream, features: features
-    )
 
     while let payload = try WasmKitError.wrap({ () throws(WasmParserError) in try parser.parseNext() }) {
         switch payload {
@@ -77,9 +46,9 @@ func parseModule<Stream: ByteStream>(stream: Stream, features: WasmFeatureSet = 
         case .functionSection(let types):
             typeIndices = types
         case .tableSection(let tableSection):
-            tables = tableSection.map(\.type)
+            tables = tableSection
         case .memorySection(let memorySection):
-            memories = memorySection.map(\.type)
+            memories = memorySection.map { $0.type }
         case .globalSection(let globalSection):
             globals = globalSection
         case .tagSection(let tagSection):

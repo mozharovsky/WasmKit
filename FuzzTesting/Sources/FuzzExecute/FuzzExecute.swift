@@ -5,12 +5,15 @@ import WasmKitFuzzing
 public func FuzzCheck(_ start: UnsafePointer<UInt8>, _ count: Int) -> CInt {
     let bytes = Array(UnsafeBufferPointer(start: start, count: count))
     do {
-        let module = try WasmKit.parseWasm(bytes: bytes)
+        let module = try WasmKit.parseWasm(bytes: bytes, features: .all)
         let engine = WasmKit.Engine()
         let store = WasmKit.Store(engine: engine)
         store.resourceLimiter = FuzzerResourceLimiter()
         let instance = try module.instantiate(store: store)
-        for export in instance.exports.values {
+        // `exports` is a Dictionary and Swift seeds its hasher per process, so
+        // iterating it directly calls the exports in a different order on every
+        // run -- an artifact would not replay the sequence that produced it.
+        for (_, export) in instance.exports.sorted(by: { $0.name < $1.name }) {
             guard case let .function(fn) = export else {
                 continue
             }

@@ -42,32 +42,40 @@ struct WatParser {
     }
 
     struct UnresolvedType<T> {
-        private let make: (any NameToIndexResolver) -> Result<T, WatParserError>
+        typealias IndexResolver = (Parser.IndexOrId) throws(WatParserError) -> Int
 
-        init(make: @escaping (any NameToIndexResolver) -> Result<T, WatParserError>) {
+        private let make: (IndexResolver) throws(WatParserError) -> T
+
+        init(make: @escaping (IndexResolver) throws(WatParserError) -> T) {
             self.make = make
         }
 
         init(_ value: T) {
-            self.make = { _ in .success(value) }
+            self.make = { _ in value }
         }
 
         func project<U>(_ keyPath: KeyPath<T, U>) -> UnresolvedType<U> {
-            return UnresolvedType<U> {
-                let parent = make($0)
-                return parent.map { $0[keyPath: keyPath] }
+            return UnresolvedType<U> { (resolveIndex: IndexResolver) throws(WatParserError) in
+                try self.make(resolveIndex)[keyPath: keyPath]
             }
         }
 
         func map<U>(_ transform: @escaping (T) -> U) -> UnresolvedType<U> {
-            return UnresolvedType<U>(make: { resolver in Result { () throws(WatParserError) in transform(try resolve(resolver)) } })
+            return UnresolvedType<U> { (resolveIndex: IndexResolver) throws(WatParserError) in
+                try transform(self.make(resolveIndex))
+            }
         }
 
         func resolve(_ typeMap: TypesMap) throws(WatParserError) -> T {
-            return try resolve(typeMap.nameMapping)
+            return try make(typeMap.nameMapping.resolveIndex)
         }
-        func resolve(_ resolver: any NameToIndexResolver) throws(WatParserError) -> T {
-            return try make(resolver).get()
+
+        func resolve(_ resolver: some NameToIndexResolver) throws(WatParserError) -> T {
+            return try make(resolver.resolveIndex)
+        }
+
+        func resolve(_ resolveIndex: IndexResolver) throws(WatParserError) -> T {
+            return try make(resolveIndex)
         }
     }
 
@@ -153,6 +161,8 @@ struct WatParser {
         var type: UnresolvedType<TableType>
         var importNames: ImportNames?
         var inlineElement: ElementDecl?
+        /// The constant expression giving every element its initial value, if any.
+        var initializer: Lexer?
     }
 
     struct ElementDecl: NamedFieldDecl {
@@ -177,6 +187,10 @@ struct WatParser {
         var mode: Mode
         var type: UnresolvedType<ReferenceType>
         var indices: Indices
+        /// Whether the segment was written as `func` followed by function
+        /// indices (or its abbreviation), whose type depends on the features:
+        /// `(ref func)` with typed function references, `funcref` without.
+        var isFunctionIndexList = false
     }
 
     struct ExportDecl {
@@ -301,6 +315,7 @@ struct WatParser {
             let importNames = try inlineImport()
             let type: UnresolvedType<TableType>
             var inlineElement: ElementDecl?
+            var initializer: Lexer?
             let isMemory64 = try expectAddressSpaceType()
 
             // elemexpr ::= '(' 'item' expr ')' | '(' instr ')'
@@ -344,25 +359,23 @@ struct WatParser {
                     )
                 }
             } else {
-                var tableType = try tableType(isMemory64: isMemory64)
-                if try parser.peek(.leftParen) != nil {
-                    let (numberOfItems, indices) = try parseExprList()
-                    inlineElement = ElementDecl(
-                        mode: .inline, type: tableType.project(\.elementType), indices: indices
-                    )
-                    tableType = tableType.map {
-                        var value = $0
-                        value.limits.min = numberOfItems
-                        return value
-                    }
+                type = try tableType(isMemory64: isMemory64)
+                // Typed function references: a constant expression after the table
+                // type gives every element its initial value.
+                if importNames == nil, try !parser.isEndOfParen() {
+                    initializer = parser.lexer
                 }
-                type = tableType
             }
             kind = .table(
                 TableDecl(
-                    id: id, exports: exports, type: type, importNames: importNames, inlineElement: inlineElement
+                    id: id, exports: exports, type: type, importNames: importNames, inlineElement: inlineElement,
+                    initializer: initializer
                 ))
-            try parser.expect(.rightParen)
+            if initializer != nil {
+                try parser.skipParenBlock()
+            } else {
+                try parser.expect(.rightParen)
+            }
         case "memory":
             let WASM_PAGE_SIZE: Int = 65536
             func alignUp(_ offset: Int, to align: Int) -> Int {
@@ -476,21 +489,25 @@ struct WatParser {
             //            | funcidx* (iff the tableuse is omitted)
             let indices: ElementDecl.Indices
             let type: UnresolvedType<ReferenceType>
+            var isFunctionIndexList = false
             if let refType = try takeRefType() {
                 indices = .elementExprList(parser.lexer)
                 type = refType
             } else if try parser.takeKeyword("func") {
                 indices = .functionList(parser.lexer)
                 type = UnresolvedType(.funcRef)
+                isFunctionIndexList = true
             } else {
                 // Try to parse as function list (abbreviated form)
                 // This works even with a table use, as long as no ref type is specified
                 indices = .functionList(parser.lexer)
                 type = UnresolvedType(.funcRef)
+                isFunctionIndexList = true
             }
 
             try parser.skipParenBlock()
-            kind = .element(ElementDecl(id: id, mode: mode, type: type, indices: indices))
+            kind = .element(
+                ElementDecl(id: id, mode: mode, type: type, indices: indices, isFunctionIndexList: isFunctionIndexList))
         case "data":
             let id = try parser.takeId()
             let memory = try memoryUse()
@@ -499,9 +516,18 @@ struct WatParser {
                 offset = .source(parser.lexer)
                 try parser.skipParenBlock()
             } else if try parser.peek(.leftParen) != nil {
-                try parser.consume()  // consume (
+                // Abbreviated offset given as a bare folded instruction, e.g. `(data (i32.const 0) "a")`.
+                // Capture the lexer at the `(`, not after it, so the offset parses as a folded instruction
+                // flattened to post-order; consuming the `(` first would emit the operator before its operands.
                 offset = .source(parser.lexer)
+                try parser.consume()  // consume (
                 try parser.skipParenBlock()  // skip offset expr
+            }
+            // `(data (memory 0) "x")` names a memory but gives no offset. The
+            // encoder cannot represent that, so reject it here rather than
+            // aborting later.
+            if memory != nil, offset == nil {
+                throw WatParserError("data segment with a memory index requires an offset", location: location)
             }
             let data = try dataString()
             kind = .data(DataSegmentDecl(id: id, memory: memory, offset: offset, data: data))
@@ -691,13 +717,11 @@ struct WatParser {
         let (params, names) = try params(mayHaveName: true)
         let results = try results()
         try parser.expect(.rightParen)
-        return UnresolvedType<FunctionType> { typeMap in
-            Result { () throws(WatParserError) in
-                let params = try params.map { param throws(WatParserError) in try param.resolve(typeMap) }
-                let results = try results.map { result throws(WatParserError) in try result.resolve(typeMap) }
-                let signature = WasmTypes.FunctionType(parameters: params, results: results)
-                return FunctionType(signature: signature, parameterNames: names)
-            }
+        return UnresolvedType<FunctionType> { (resolveIndex: UnresolvedType<ValueType>.IndexResolver) throws(WatParserError) in
+            let params = try params.map { param throws(WatParserError) in try param.resolve(resolveIndex) }
+            let results = try results.map { result throws(WatParserError) in try result.resolve(resolveIndex) }
+            let signature = WasmTypes.FunctionType(parameters: params, results: results)
+            return FunctionType(signature: signature, parameterNames: names)
         }
     }
 
@@ -707,13 +731,11 @@ struct WatParser {
         if results.isEmpty, params.isEmpty {
             return nil
         }
-        return UnresolvedType<FunctionType> { typeMap in
-            Result { () throws(WatParserError) in
-                let params = try params.map { resolver throws(WatParserError) in try resolver.resolve(typeMap) }
-                let results = try results.map { resolver throws(WatParserError) in try resolver.resolve(typeMap) }
-                let signature = WasmTypes.FunctionType(parameters: params, results: results)
-                return FunctionType(signature: signature, parameterNames: names)
-            }
+        return UnresolvedType<FunctionType> { (resolveIndex: UnresolvedType<ValueType>.IndexResolver) throws(WatParserError) in
+            let params = try params.map { param throws(WatParserError) in try param.resolve(resolveIndex) }
+            let results = try results.map { result throws(WatParserError) in try result.resolve(resolveIndex) }
+            let signature = WasmTypes.FunctionType(parameters: params, results: results)
+            return FunctionType(signature: signature, parameterNames: names)
         }
     }
 
@@ -791,8 +813,8 @@ struct WatParser {
         } else if try parser.takeKeyword("exn") {
             return UnresolvedType(.abstract(.exnRef))
         } else if let id = try parser.takeIndexOrId() {
-            return UnresolvedType(make: { resolver in
-                Result { () throws(WatParserError) in try .concrete(typeIndex: UInt32(resolver.resolveIndex(use: id))) }
+            return UnresolvedType(make: { (resolveIndex: UnresolvedType<HeapType>.IndexResolver) throws(WatParserError) in
+                try .concrete(typeIndex: UInt32(resolveIndex(id)))
             })
         }
         throw WatParserError("expected heap type", location: parser.lexer.location())
