@@ -300,12 +300,16 @@ extension InternalFunction {
     /// Calls a host function from outside a guest.
     ///
     /// A requested stop takes precedence over the host's result, its error and result validation.
+    /// A call from outside a guest has no guest invocation to pause, so a ``HostCallSuspension``
+    /// fails as ``ResumableCallError/suspensionUnavailable``, as it does inside a synchronous
+    /// guest invocation.
     ///
     /// - Parameters:
     ///   - arguments: Values in the resolved function signature's parameter order.
     ///   - store: The function's owning store.
     /// - Returns: The validated results.
-    /// - Throws: Requested termination, a signature mismatch, or the host function's failure.
+    /// - Throws: Requested termination, a signature mismatch,
+    ///   ``ResumableCallError/suspensionUnavailable``, or the host function's failure.
     private func invokeHost(_ arguments: [Value], store: Store) throws -> [Value] {
         let entity = host
         let resolvedType = store.engine.resolveType(entity.type)
@@ -319,6 +323,9 @@ extension InternalFunction {
                     try implementation(caller, parameters, out)
                 }
             }
+        } catch is HostCallSuspension {
+            try store.executionControl?.check()
+            throw ResumableCallError.suspensionUnavailable
         } catch {
             try store.executionControl?.check()
             throw error

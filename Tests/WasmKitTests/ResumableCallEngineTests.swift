@@ -255,6 +255,24 @@ struct ResumableCallEngineTests {
     }
 
     @Test(arguments: ResumableCallTests.threadingModels)
+    func aDirectCallOfAPausingHostFunctionIsRefused(_ threadingModel: EngineConfiguration.ThreadingModel) throws {
+        let store = Store(engine: Engine(configuration: EngineConfiguration(threadingModel: threadingModel)))
+        let pausing = Function(store: store, parameters: [], results: [.i32]) { _, _ in
+            throw HostCallSuspension(tag: 1)
+        }
+        // A host function invoked by the embedder has no guest invocation that could pause.
+        #expect(throws: ResumableCallError.suspensionUnavailable) { _ = try pausing() }
+        var stack = ExecutionStack(engine: store.engine)
+        do {
+            _ = try pausing.invoke([], on: &stack)
+            Issue.record("The direct call on a caller-owned stack paused.")
+        } catch let error as ResumableCallError {
+            #expect(error == .suspensionUnavailable)
+        }
+        #expect(store.resumableStackEnd == nil)
+    }
+
+    @Test(arguments: ResumableCallTests.threadingModels)
     func aNestedResumableInvocationKeepsItsOwnPauses(_ threadingModel: EngineConfiguration.ThreadingModel) throws {
         let fixture = try Fixture(
             Self.memoryAndReentry, threadingModel: threadingModel,

@@ -108,6 +108,18 @@ struct ResumableExecutionControlTests {
     }
 
     @Test
+    func aStopOutranksTheRefusalOfADirectHostPause() throws {
+        let control = try ExecutionControl()
+        let store = try Store(
+            engine: Engine(configuration: EngineConfiguration(threadingModel: .token)), executionControl: control)
+        let pausing = Function(store: store, parameters: [], results: [.i32]) { _, _ in
+            control.requestInterruption()
+            throw HostCallSuspension(tag: 1)
+        }
+        #expect(throws: ExecutionTermination.interrupted) { _ = try pausing() }
+    }
+
+    @Test
     func aStopRequestedFromAnotherThreadDuringALongImportWins() throws {
         let control = try ExecutionControl()
         let entered = DispatchSemaphore(value: 0)
