@@ -41,6 +41,56 @@ struct ResumableCallEngineTests {
                 == [.i32(15)])
     }
 
+    static let deliveredFailures = """
+        (module
+          (import "env" "pause" (func $pause (result i32)))
+          (tag $t (param i32))
+          (func (export "raise") (param i32) (throw $t (local.get 0)))
+          (func (export "trap") (unreachable))
+          (func (export "guarded") (result i32)
+            (block $h (result i32)
+              (try_table (result i32) (catch $t $h)
+                (i32.add (call $pause) (i32.const 1000)))))
+          (func (export "unguarded") (result i32) (call $pause)))
+        """
+
+    @Test(arguments: ResumableCallTests.threadingModels)
+    func aResumeDeliversAGuestExceptionOrATrap(_ threadingModel: EngineConfiguration.ThreadingModel) throws {
+        let fixture = try Fixture(
+            Self.deliveredFailures, threadingModel: threadingModel, features: [.exceptionHandling],
+            hosts: ["pause": ResumableCallTests.pause])
+        // The embedder receives the guest's exception and trap from synchronous calls.
+        var exception: WasmKitException?
+        do { _ = try fixture.export("raise")([.i32(77)]) } catch let error as WasmKitException { exception = error }
+        var trap: Trap?
+        do { _ = try fixture.export("trap")() } catch let error as Trap { trap = error }
+        let raised = try #require(exception)
+
+        // A handler in the paused frame receives the payload, and the addition after the call
+        // never runs.
+        let guarded = try ResumableCallTests.suspended(try fixture.export("guarded").invokeResumable())
+        #expect(
+            try ResumableCallTests.finished(try guarded.resume(throwing: raised, in: fixture.store)) == [.i32(77)])
+
+        // Without a handler the exception ends the invocation, and so does a trap.
+        let unguarded = try ResumableCallTests.suspended(try fixture.export("unguarded").invokeResumable())
+        do {
+            _ = try unguarded.resume(throwing: raised, in: fixture.store)
+            Issue.record("The exception did not end the invocation.")
+        } catch is WasmKitException {}
+        let trapped = try ResumableCallTests.suspended(try fixture.export("unguarded").invokeResumable())
+        do {
+            _ = try trapped.resume(throwing: try #require(trap), in: fixture.store)
+            Issue.record("The trap did not end the invocation.")
+        } catch let error as Trap {
+            guard case .unreachable = error.reason else {
+                Issue.record("Unexpected trap \(error)")
+                return
+            }
+        }
+        #expect(fixture.store.resumableStackEnd == nil)
+    }
+
     // MARK: - Tail calls
 
     static let tailCalls = """
