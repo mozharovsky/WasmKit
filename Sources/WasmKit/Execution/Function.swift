@@ -284,6 +284,16 @@ extension InternalFunction {
         return zip(values, expectedTypes).allSatisfy { $0.matches($1) }
     }
 
+    /// Checks arguments against a function's parameter types.
+    ///
+    /// - Parameters:
+    ///   - type: The function's signature.
+    ///   - arguments: The arguments to check.
+    /// - Throws: A trap naming the expected and the given types when they differ.
+    func checkParameters(of type: FunctionType, _ arguments: [Value]) throws {
+        try check(functionType: type, parameters: arguments)
+    }
+
     private func check(functionType: FunctionType, parameters: [Value]) throws {
         guard check(expectedTypes: functionType.parameters, values: parameters) else {
             throw Trap(.parameterTypesMismatch(expected: functionType.parameters, got: parameters))

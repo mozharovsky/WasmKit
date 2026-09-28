@@ -9,7 +9,10 @@ struct Execution: ~Copyable {
     let store: StoreRef
 
     /// The end of the VM stack space.
-    private let stackEnd: UnsafeMutablePointer<StackSlot>
+    ///
+    /// It also identifies the execution: every execution runs on its own stack, so a resumable
+    /// invocation recognizes a suspension requested by its own host call by this address.
+    let stackEnd: UnsafeMutablePointer<StackSlot>
     /// The error trap thrown during execution.
     /// This property must not be assigned to be non-nil more than once.
     /// - Note: If the trap is set, it must be released manually.
@@ -35,12 +38,14 @@ struct Execution: ~Copyable {
         let payloadRegBase: VReg
     }
 
-    #if WasmDebuggingSupport
-        package init(store: StoreRef, stackEnd: UnsafeMutablePointer<StackSlot>) {
-            self.store = store
-            self.stackEnd = stackEnd
-        }
-    #endif
+    /// Creates an execution state on the stack that ends at `stackEnd`.
+    ///
+    /// The debugger and resumable invocations re-enter the dispatch loops with a state they own,
+    /// so the state is created apart from ``with(store:stack:body:)``.
+    package init(store: StoreRef, stackEnd: UnsafeMutablePointer<StackSlot>) {
+        self.store = store
+        self.stackEnd = stackEnd
+    }
 
     /// Executes the given closure with a new execution state associated with
     /// the given ``Store`` instance, running on the given stack.
@@ -782,7 +787,7 @@ extension Execution {
                 spAddend: spAddend, sp: sp, pc: pc, md: &md, ms: &ms
             )
         } else {
-            try invokeHostFunction(function: function.host, sp: sp, spAddend: spAddend)
+            try invokeHostFunction(function: function.host, sp: sp, spAddend: spAddend, pc: pc)
             // A host function may re-enter the guest and grow the caller's
             // default memory. A malloc-backed memory moves when it grows, so the
             // cached base and bound would otherwise be left dangling.
@@ -805,7 +810,7 @@ extension Execution {
                 sp: sp, md: &md, ms: &ms
             )
         } else {
-            try invokeHostFunction(function: function.host, sp: sp, spAddend: .zero)
+            try invokeHostFunction(function: function.host, sp: sp, spAddend: .zero, pc: pc)
             if let instance = sp.currentInstance {
                 CurrentMemory.mayUpdateCurrentInstance(instance: instance, md: &md, ms: &ms)
             }
@@ -872,9 +877,13 @@ extension Execution {
     ///
     /// Note that this function does not modify neither the positions of the
     /// stack pointer nor the program counter.
+    ///
+    /// A host function that throws ``HostCallSuspension`` asks to pause the invocation at this
+    /// call. `pc` is where the caller continues after the call, which a resumable invocation
+    /// records together with `sp` and `spAddend`.
     @inline(never)
     private func invokeHostFunction(
-        function: EntityHandle<HostFunctionEntity>, sp: Sp, spAddend: VReg
+        function: EntityHandle<HostFunctionEntity>, sp: Sp, spAddend: VReg, pc: Pc
     ) throws {
         let parameterTypes = function.parameterTypes
         let resultTypes = function.resultTypes
@@ -909,26 +918,53 @@ extension Execution {
             }
             defer { parameters.deinitialize() }
 
-            // Most host functions return nothing -- every drawing call a
-            // fantasy console offers, for one -- so the result buffer and the
-            // store-back loop are skipped rather than run empty.
-            if resultTypes.isEmpty {
-                return try implementation(
-                    caller, UnsafeBufferPointer(parameters), .init(start: nil, count: 0))
-            }
-            return try withUnsafeTemporaryAllocation(of: Value.self, capacity: resultTypes.count) {
-                results throws -> Void in
-                for index in 0..<resultTypes.count {
-                    results.initializeElement(at: index, to: .i32(0))
+            do {
+                // Most host functions return nothing -- every drawing call a
+                // fantasy console offers, for one -- so the result buffer and the
+                // store-back loop are skipped rather than run empty.
+                if resultTypes.isEmpty {
+                    return try implementation(
+                        caller, UnsafeBufferPointer(parameters), .init(start: nil, count: 0))
                 }
-                defer { results.deinitialize() }
-                try implementation(caller, UnsafeBufferPointer(parameters), results)
-                for index in 0..<resultTypes.count {
-                    sp.storeValue(
-                        results[index], at: spAddend + layout.returnReg(index),
-                        type: resultTypes[index])
+                return try withUnsafeTemporaryAllocation(of: Value.self, capacity: resultTypes.count) {
+                    results throws -> Void in
+                    for index in 0..<resultTypes.count {
+                        results.initializeElement(at: index, to: .i32(0))
+                    }
+                    defer { results.deinitialize() }
+                    try implementation(caller, UnsafeBufferPointer(parameters), results)
+                    for index in 0..<resultTypes.count {
+                        sp.storeValue(
+                            results[index], at: spAddend + layout.returnReg(index),
+                            type: resultTypes[index])
+                    }
                 }
+            } catch let request as HostCallSuspension {
+                throw suspension(
+                    request, function: function, arguments: UnsafeBufferPointer(parameters),
+                    sp: sp, pc: pc, spAddend: spAddend)
             }
         }
+    }
+
+    /// Turns a host function's request to pause into the error that unwinds the dispatch loop.
+    ///
+    /// Only the resumable invocation that is running on this execution's stack can pause. Any
+    /// other execution, such as a synchronous call a host function makes into the guest, would
+    /// lose native frames that the pause cannot keep, so its request fails instead.
+    ///
+    /// - Returns: ``SuspendedHostCall`` with the call's position and a copy of its arguments,
+    ///   or ``ResumableCallError/suspensionUnavailable``.
+    @inline(never)
+    private func suspension(
+        _ request: HostCallSuspension, function: EntityHandle<HostFunctionEntity>,
+        arguments: UnsafeBufferPointer<Value>, sp: Sp, pc: Pc, spAddend: VReg
+    ) -> any Error {
+        guard store.value.resumableStackEnd == stackEnd else {
+            return ResumableCallError.suspensionUnavailable
+        }
+        return SuspendedHostCall(
+            request: request, function: function, arguments: Array(arguments),
+            sp: sp, pc: pc, spAddend: spAddend)
     }
 }
