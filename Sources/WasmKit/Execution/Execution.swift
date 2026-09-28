@@ -908,6 +908,11 @@ extension Execution {
         // nothing. A host function written against the array-based API is
         // wrapped when it is created, so there is only this one shape here.
         let implementation = function.implementation
+        // The closure below reads these copies instead of `self`. Needing the
+        // whole execution state here would make `invoke` take it whole, and
+        // every call handler would then copy it to the native stack.
+        let store = self.store
+        let stackEnd = self.stackEnd
         try withUnsafeTemporaryAllocation(of: Value.self, capacity: parameterTypes.count) {
             parameters throws -> Void in
             for index in 0..<parameterTypes.count {
@@ -940,25 +945,35 @@ extension Execution {
                     }
                 }
             } catch let request as HostCallSuspension {
-                throw suspension(
+                throw Self.suspension(
                     request, function: function, arguments: UnsafeBufferPointer(parameters),
-                    sp: sp, pc: pc, spAddend: spAddend)
+                    sp: sp, pc: pc, spAddend: spAddend, store: store, stackEnd: stackEnd)
             }
         }
     }
 
     /// Turns a host function's request to pause into the error that unwinds the dispatch loop.
     ///
-    /// Only the resumable invocation that is running on this execution's stack can pause. Any
-    /// other execution, such as a synchronous call a host function makes into the guest, would
+    /// Only the resumable invocation that is running on the stack ending at `stackEnd` can pause.
+    /// Any other execution, such as a synchronous call a host function makes into the guest, would
     /// lose native frames that the pause cannot keep, so its request fails instead.
     ///
+    /// - Parameters:
+    ///   - request: The host function's request.
+    ///   - function: The host function that asked to pause.
+    ///   - arguments: The call's arguments, valid only during this call and copied here.
+    ///   - sp: The frame of the calling guest function.
+    ///   - pc: The position after the call instruction.
+    ///   - spAddend: The offset from `sp` of the call's argument and result registers.
+    ///   - store: The store that runs the execution.
+    ///   - stackEnd: The end of the execution's stack, which identifies the execution.
     /// - Returns: ``SuspendedHostCall`` with the call's position and a copy of its arguments,
     ///   or ``ResumableCallError/suspensionUnavailable``.
     @inline(never)
-    private func suspension(
+    private static func suspension(
         _ request: HostCallSuspension, function: EntityHandle<HostFunctionEntity>,
-        arguments: UnsafeBufferPointer<Value>, sp: Sp, pc: Pc, spAddend: VReg
+        arguments: UnsafeBufferPointer<Value>, sp: Sp, pc: Pc, spAddend: VReg,
+        store: StoreRef, stackEnd: UnsafeMutablePointer<StackSlot>
     ) -> any Error {
         guard store.value.resumableStackEnd == stackEnd else {
             return ResumableCallError.suspensionUnavailable
