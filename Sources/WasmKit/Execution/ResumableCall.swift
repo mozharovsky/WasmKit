@@ -105,6 +105,11 @@ public enum ResumeRejection: Error, Sendable, Equatable {
 ///
 /// The continuation is not `Sendable`, like the ``Store`` it keeps. Keep it on the executor that
 /// owns the store and send only ``id``, ``arguments``, and the results across executors.
+///
+/// On a store bound to an ``ExecutionControl``, a requested stop ends the invocation at its next
+/// resume, before any other check, and the resume throws the controller's
+/// ``ExecutionTermination``. The controller is only a signal and does not release a paused
+/// invocation by itself. Its owner releases it by resuming or cancelling the continuation.
 public struct SuspendedCall: ~Copyable {
     /// The paused invocation.
     let state: ResumableExecutionState
@@ -134,11 +139,13 @@ public struct SuspendedCall: ~Copyable {
     ///   - id: The identifier of the pause the results complete.
     ///   - store: The store that paused.
     /// - Returns: The finished results, the next pause, or the refusal.
-    /// - Throws: A trap or an error that ends the invocation after it continued. The invocation
-    ///   is released before the error is thrown.
+    /// - Throws: The paused store's ``ExecutionTermination`` when its controller requested a stop,
+    ///   or a trap or an error that ends the invocation after it continued. The invocation is
+    ///   released before the error is thrown.
     public consuming func resume(
         returning results: [Value], completing id: SuspensionID, in store: Store
     ) throws -> ResumeResult {
+        try checkExecutionControl()
         if let rejection = rejection(completing: id, store: store) {
             return .rejected(self, rejection)
         }
@@ -166,7 +173,8 @@ public struct SuspendedCall: ~Copyable {
     ///   - results: The host function's results.
     ///   - store: The store that paused.
     /// - Returns: The finished results, the next pause, or the refusal.
-    /// - Throws: A trap or an error that ends the invocation after it continued.
+    /// - Throws: The paused store's ``ExecutionTermination`` when its controller requested a stop,
+    ///   or a trap or an error that ends the invocation after it continued.
     public consuming func resume(returning results: [Value], in store: Store) throws -> ResumeResult {
         let id = self.id
         return try resume(returning: results, completing: id, in: store)
@@ -180,8 +188,8 @@ public struct SuspendedCall: ~Copyable {
     ///   - error: The host function's failure.
     ///   - store: The store that paused.
     /// - Returns: The finished results, the next pause, or the refusal.
-    /// - Throws: The error when no guest handler catches it, or an error raised after the
-    ///   guest continued.
+    /// - Throws: The paused store's ``ExecutionTermination`` when its controller requested a stop,
+    ///   the error when no guest handler catches it, or an error raised after the guest continued.
     public consuming func resume(throwing error: any Error, in store: Store) throws -> ResumeResult {
         let id = self.id
         return try resume(throwing: error, completing: id, in: store)
@@ -197,11 +205,13 @@ public struct SuspendedCall: ~Copyable {
     ///   - id: The identifier of the pause the failure completes.
     ///   - store: The store that paused.
     /// - Returns: The finished results, the next pause, or the refusal.
-    /// - Throws: The error when no guest handler catches it, or an error raised after the
-    ///   guest continued. The invocation is released before the error is thrown.
+    /// - Throws: The paused store's ``ExecutionTermination`` when its controller requested a stop,
+    ///   the error when no guest handler catches it, or an error raised after the guest continued.
+    ///   The invocation is released before the error is thrown.
     public consuming func resume(
         throwing error: any Error, completing id: SuspensionID, in store: Store
     ) throws -> ResumeResult {
+        try checkExecutionControl()
         if let rejection = rejection(completing: id, store: store) {
             return .rejected(self, rejection)
         }
@@ -214,6 +224,16 @@ public struct SuspendedCall: ~Copyable {
     /// The guest stack and the rest of the invocation's state are freed. A completion that
     /// arrives later has no continuation to resume.
     public consuming func cancel() {}
+
+    /// Ends the invocation when the store that paused it has stopped.
+    ///
+    /// A stopped store never runs guest code again, so this check comes before every other check
+    /// of a completion.
+    ///
+    /// - Throws: The first ``ExecutionTermination`` the store's controller received.
+    private func checkExecutionControl() throws {
+        try state.store.executionControl?.check()
+    }
 
     /// Checks a completion against this pause and its store.
     ///
@@ -333,7 +353,7 @@ final class ResumableExecutionState {
         let paused = try run { execution in
             try execution.execute(sp: rootSp, pc: rootCode, handle: function, type: type)
         }
-        guard let paused else { return .finished(results()) }
+        guard let paused else { return .finished(try finish()) }
         return .suspended(pause(paused))
     }
 
@@ -386,8 +406,20 @@ final class ResumableExecutionState {
                 return
             }
         }
-        guard let paused else { return .finished(results()) }
+        guard let paused else { return .finished(try finish()) }
         return .suspended(pause(paused))
+    }
+
+    /// Reads the results of the finished invocation after a last check of the store's controller.
+    ///
+    /// A synchronous invocation checks at the same boundary, so a stop requested while the guest
+    /// returned still takes precedence over its results.
+    ///
+    /// - Returns: The root function's results in declaration order.
+    /// - Throws: The store's ``ExecutionTermination`` when its controller requested a stop.
+    private func finish() throws -> [Value] {
+        try store.executionControl?.check()
+        return results()
     }
 
     /// Runs the guest on this invocation's stack and classifies how it stopped.
@@ -455,11 +487,18 @@ extension Function {
     /// returned ``SuspendedCall`` continues the guest from the call once the embedder has the
     /// host function's results, on whichever executor owns the store.
     ///
+    /// A store bound to an ``ExecutionControl`` checks its controller where ``invoke(_:)`` does:
+    /// at entry, when each host call returns or throws, while the guest runs, and before results
+    /// return. A stop requested during a host call also outranks that call's request to pause.
+    /// A resumed invocation keeps polling the controller.
+    ///
     /// - Parameter arguments: The arguments to pass to the function.
     /// - Returns: The finished results or the first pause.
-    /// - Throws: A trap or an error that ends the invocation, ``ResumableCallError/notAGuestFunction``
-    ///   for a host function, or a parameter type mismatch.
+    /// - Throws: The store's ``ExecutionTermination`` when its controller requested a stop, a trap
+    ///   or an error that ends the invocation, ``ResumableCallError/notAGuestFunction`` for a host
+    ///   function, or a parameter type mismatch.
     public func invokeResumable(_ arguments: [Value] = []) throws -> ResumableCall {
+        try store.executionControl?.check()
         guard handle.isWasm else { throw ResumableCallError.notAGuestFunction }
         let type = store.engine.resolveType(handle.wasm.type)
         try handle.checkParameters(of: type, arguments)
