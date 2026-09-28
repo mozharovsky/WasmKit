@@ -114,6 +114,36 @@ struct ResumableCallEngineTests {
                 == [.i32(100)])
     }
 
+    static let indirectCalls = """
+        (module
+          (import "env" "pause" (func $pause (param i32) (result i32)))
+          (type $unary (func (param i32) (result i32)))
+          (table 1 funcref)
+          (elem (i32.const 0) func $pause)
+          (func $tail (param i32) (result i32)
+            (return_call_indirect (type $unary) (local.get 0) (i32.const 0)))
+          (func (export "indirect") (param i32) (result i32)
+            (i32.add
+              (call_indirect (type $unary) (local.get 0) (i32.const 0))
+              (call $tail (i32.add (local.get 0) (i32.const 1))))))
+        """
+
+    @Test(arguments: ResumableCallTests.threadingModels)
+    func indirectCallsToTheHostPause(_ threadingModel: EngineConfiguration.ThreadingModel) throws {
+        let fixture = try Fixture(
+            Self.indirectCalls, threadingModel: threadingModel, features: [.tailCall],
+            hosts: ["pause": ResumableCallTests.pause])
+        let first = try ResumableCallTests.suspended(try fixture.export("indirect").invokeResumable([.i32(10)]))
+        #expect(first.arguments == [.i32(10)])
+        let second = try ResumableCallTests.suspended(try first.resume(returning: [.i32(100)], in: fixture.store))
+        // The second pause comes from a tail call through the table.
+        #expect(second.arguments == [.i32(11)])
+        #expect(
+            try ResumableCallTests.finished(try second.resume(returning: [.i32(1000)], in: fixture.store))
+                == [.i32(1100)])
+        #expect(fixture.count("pause") == 2)
+    }
+
     // MARK: - Memory and reentry
 
     static let memoryAndReentry = """
@@ -149,6 +179,41 @@ struct ResumableCallEngineTests {
         #expect(
             try ResumableCallTests.finished(try paused.resume(returning: [.i32(0)], in: fixture.store))
                 == [.i32(41 + 100 + 2 + 5)])
+    }
+
+    static let outOfBounds = """
+        (module
+          (import "env" "pause" (func $pause (result i32)))
+          (memory 1)
+          (func (export "load") (result i32)
+            (i32.load (i32.add (call $pause) (i32.const 65528)))))
+        """
+
+    @Test(
+        arguments: ResumableCallTests.threadingModels,
+        [EngineConfiguration.MemoryBoundsChecking.mprotect, .software])
+    func anOutOfBoundsAccessAfterAResumeTraps(
+        _ threadingModel: EngineConfiguration.ThreadingModel,
+        _ memoryBoundsChecking: EngineConfiguration.MemoryBoundsChecking
+    ) throws {
+        let fixture = try Fixture(
+            Self.outOfBounds, threadingModel: threadingModel, memoryBoundsChecking: memoryBoundsChecking,
+            hosts: ["pause": ResumableCallTests.pause])
+        let inBounds = try ResumableCallTests.suspended(try fixture.export("load").invokeResumable())
+        #expect(try ResumableCallTests.finished(try inBounds.resume(returning: [.i32(0)], in: fixture.store)) == [.i32(0)])
+        // The continued guest runs under the same bounds checks as a synchronous call, including
+        // the guard pages of the mprotect strategy.
+        let outside = try ResumableCallTests.suspended(try fixture.export("load").invokeResumable())
+        do {
+            _ = try outside.resume(returning: [.i32(8)], in: fixture.store)
+            Issue.record("The load past the end of memory did not trap.")
+        } catch let trap as Trap {
+            guard case .memoryOutOfBounds = trap.reason else {
+                Issue.record("Unexpected trap \(trap)")
+                return
+            }
+        }
+        #expect(fixture.store.resumableStackEnd == nil)
     }
 
     @Test(arguments: ResumableCallTests.threadingModels)
