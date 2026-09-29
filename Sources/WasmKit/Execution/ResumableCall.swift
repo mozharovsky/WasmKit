@@ -8,7 +8,8 @@ import struct WasmTypes.FunctionType
 /// results the embedder passes to ``SuspendedCall/resume(returning:completing:in:)``.
 ///
 /// Any other invocation, including a synchronous call that a host function makes into a guest,
-/// cannot pause. There the request fails with ``ResumableCallError/suspensionUnavailable``.
+/// cannot pause. There the request fails with ``ResumableCallError/suspensionUnavailable``. A
+/// request passed to ``SuspendedCall/resume(throwing:in:)`` fails the same way.
 public struct HostCallSuspension: Error, Sendable, Equatable {
     /// A value the embedder chooses to recognize the request, reported by ``SuspendedCall/tag``.
     public var tag: UInt64
@@ -189,7 +190,8 @@ public struct SuspendedCall: ~Copyable {
     ///   - store: The store that paused.
     /// - Returns: The finished results, the next pause, or the refusal.
     /// - Throws: The paused store's ``ExecutionTermination`` when its controller requested a stop,
-    ///   the error when no guest handler catches it, or an error raised after the guest continued.
+    ///   the error when no guest handler catches it, ``ResumableCallError/suspensionUnavailable``
+    ///   for a ``HostCallSuspension``, or an error raised after the guest continued.
     public consuming func resume(throwing error: any Error, in store: Store) throws -> ResumeResult {
         let id = self.id
         return try resume(throwing: error, completing: id, in: store)
@@ -198,7 +200,9 @@ public struct SuspendedCall: ~Copyable {
     /// Continues the guest as if the host function had thrown `error`.
     ///
     /// A ``WasmKitException`` reaches the guest's exception handlers. A ``Trap`` or any other
-    /// error ends the invocation, as it does when a synchronous host function throws it.
+    /// error ends the invocation, as it does when a synchronous host function throws it. A
+    /// ``HostCallSuspension`` cannot pause the completed call again, so it ends the invocation with
+    /// ``ResumableCallError/suspensionUnavailable``.
     ///
     /// - Parameters:
     ///   - error: The host function's failure.
@@ -206,7 +210,8 @@ public struct SuspendedCall: ~Copyable {
     ///   - store: The store that paused.
     /// - Returns: The finished results, the next pause, or the refusal.
     /// - Throws: The paused store's ``ExecutionTermination`` when its controller requested a stop,
-    ///   the error when no guest handler catches it, or an error raised after the guest continued.
+    ///   the error when no guest handler catches it, ``ResumableCallError/suspensionUnavailable``
+    ///   for a ``HostCallSuspension``, or an error raised after the guest continued.
     ///   The invocation is released before the error is thrown.
     public consuming func resume(
         throwing error: any Error, completing id: SuspensionID, in store: Store
@@ -391,6 +396,10 @@ final class ResumableExecutionState {
                     else { throw exception }
                 } else if let trap = error as? Trap {
                     throw trap.withBacktrace(Execution.captureBacktrace(sp: sp, store: store))
+                } else if error is HostCallSuspension {
+                    // Completing a pause with another request to pause is not supported, so it
+                    // fails as a request from an invocation that cannot pause does.
+                    throw ResumableCallError.suspensionUnavailable
                 } else {
                     throw error
                 }

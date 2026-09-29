@@ -273,6 +273,27 @@ struct ResumableCallEngineTests {
     }
 
     @Test(arguments: ResumableCallTests.threadingModels)
+    func aPauseDeliveredAsTheHostsFailureIsRefused(_ threadingModel: EngineConfiguration.ThreadingModel) throws {
+        let fixture = try Fixture(
+            ResumableCallTests.failures, threadingModel: threadingModel,
+            hosts: ["pause": ResumableCallTests.pause, "fail": { _, _ in [.i32(0)] }])
+        let paused = try ResumableCallTests.suspended(try fixture.export("fail_after").invokeResumable())
+        // The call has already paused, so a request to pause cannot complete it.
+        do {
+            _ = try paused.resume(throwing: HostCallSuspension(tag: 2), in: fixture.store)
+            Issue.record("A request to pause completed the paused call.")
+        } catch let error as ResumableCallError {
+            #expect(error == .suspensionUnavailable)
+        }
+        #expect(fixture.count("pause") == 1)
+        #expect(fixture.store.resumableStackEnd == nil)
+        // The store starts the next invocation normally.
+        let next = try ResumableCallTests.suspended(try fixture.export("fail_after").invokeResumable())
+        #expect(next.tag == 7)
+        next.cancel()
+    }
+
+    @Test(arguments: ResumableCallTests.threadingModels)
     func aNestedResumableInvocationKeepsItsOwnPauses(_ threadingModel: EngineConfiguration.ThreadingModel) throws {
         let fixture = try Fixture(
             Self.memoryAndReentry, threadingModel: threadingModel,
