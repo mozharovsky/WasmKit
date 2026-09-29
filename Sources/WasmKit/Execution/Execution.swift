@@ -930,7 +930,8 @@ extension Execution {
     /// Invokes a host import without moving the calling frame or its program counter.
     ///
     /// A requested interruption takes precedence over the native result, a thrown host error and a
-    /// request to pause. A live store preserves the original host failure.
+    /// request to pause. The controller is checked as soon as the host returns, before any result
+    /// is read from its buffer. A live store preserves the original host failure.
     ///
     /// A host function that throws ``HostCallSuspension`` asks to pause the invocation at this
     /// call. `pc` is where the caller continues after the call, which a resumable invocation
@@ -994,8 +995,10 @@ extension Execution {
                     // fantasy console offers, for one -- so the result buffer and the
                     // store-back loop are skipped rather than run empty.
                     if resultTypes.isEmpty {
-                        return try implementation(
+                        try implementation(
                             caller, UnsafeBufferPointer(parameters), .init(start: nil, count: 0))
+                        try executionControl?.check()
+                        return
                     }
                     return try withUnsafeTemporaryAllocation(of: Value.self, capacity: resultTypes.count) {
                         results throws -> Void in
@@ -1004,6 +1007,9 @@ extension Execution {
                         }
                         defer { results.deinitialize() }
                         try implementation(caller, UnsafeBufferPointer(parameters), results)
+                        // A requested stop outranks the results. Storing them would first
+                        // judge their types for a guest that never reads them.
+                        try executionControl?.check()
                         for index in 0..<resultTypes.count {
                             sp.storeValue(
                                 results[index], at: spAddend + layout.returnReg(index),
@@ -1022,7 +1028,6 @@ extension Execution {
             try executionControl?.check()
             throw error
         }
-        try executionControl?.check()
     }
 
     /// Turns a host function's request to pause into the error that unwinds the dispatch loop.
