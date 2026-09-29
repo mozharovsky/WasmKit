@@ -925,7 +925,8 @@ extension Execution {
     /// Invokes a host import without moving the calling frame or its program counter.
     ///
     /// A requested interruption takes precedence over the native result or a thrown host error.
-    /// A live store preserves the original host failure.
+    /// The controller is checked as soon as the host returns, before any result is read from its
+    /// buffer. A live store preserves the original host failure.
     ///
     /// - Parameters:
     ///   - function: The imported host entity whose signature determines argument and result slots.
@@ -976,8 +977,10 @@ extension Execution {
                 // fantasy console offers, for one -- so the result buffer and the
                 // store-back loop are skipped rather than run empty.
                 if resultTypes.isEmpty {
-                    return try implementation(
+                    try implementation(
                         caller, UnsafeBufferPointer(parameters), .init(start: nil, count: 0))
+                    try executionControl?.check()
+                    return
                 }
                 return try withUnsafeTemporaryAllocation(of: Value.self, capacity: resultTypes.count) {
                     results throws -> Void in
@@ -986,6 +989,9 @@ extension Execution {
                     }
                     defer { results.deinitialize() }
                     try implementation(caller, UnsafeBufferPointer(parameters), results)
+                    // A requested stop outranks the results. Storing them would first judge their
+                    // types for a guest that never reads them.
+                    try executionControl?.check()
                     for index in 0..<resultTypes.count {
                         sp.storeValue(
                             results[index], at: spAddend + layout.returnReg(index),
@@ -999,6 +1005,5 @@ extension Execution {
             try executionControl?.check()
             throw error
         }
-        try executionControl?.check()
     }
 }

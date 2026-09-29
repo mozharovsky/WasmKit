@@ -136,6 +136,70 @@ struct ExecutionInterruptionTests {
         }
     }
 
+    /// Stops a raw host import before its results are read, for each way of reaching the host.
+    ///
+    /// The host writes an `i32` into its `v128` result. Storing that value on the guest stack
+    /// fails a precondition, so the call through WebAssembly ends with the requested reason only
+    /// when the engine checks the controller before it reads the result. The direct call and the
+    /// array-based import already check first and serve as controls.
+    ///
+    /// - Parameters:
+    ///   - path: How the host function is reached.
+    ///   - reason: The terminal reason that the host requests.
+    /// - Throws: Fixture, configuration, or export failures.
+    @Test(arguments: RawImportPath.allCases, [ExecutionTermination.interrupted, .deadlineExceeded])
+    func aStopOutranksTheResultsOfARawImport(path: RawImportPath, reason: ExecutionTermination) throws {
+        let control = try ExecutionControl()
+        let store = try controlledStore(control)
+        let host: Function
+        if path == .arrayImport {
+            host = Function(store: store, parameters: [], results: [.v128]) { _, _ in
+                control.requestInterruption(reason: reason)
+                return [.i32(42)]
+            }
+        } else {
+            host = Function(
+                store: store, parameters: [], results: [.v128],
+                raw: { _, _, results in
+                    control.requestInterruption(reason: reason)
+                    results[0] = .i32(42)
+                })
+        }
+        if path == .direct {
+            #expect(throws: reason) { try host() }
+            return
+        }
+        let instance = try rawImportFixture(store: store, host: host)
+        let run = try #require(instance.exports[function: "run"])
+        #expect(throws: reason) { try run() }
+        #expect(instance.exports[global: "after"]?.value == .i32(0))
+    }
+
+    /// Delivers a raw host import's results to the guest when nothing stops the store.
+    ///
+    /// - Parameters:
+    ///   - threadingModel: The dispatch model of the store.
+    ///   - controlled: Whether the store has a controller, which is never signalled. Only token
+    ///     dispatch supports one.
+    /// - Throws: Fixture, configuration, export, or invocation failures.
+    @Test(arguments: [(EngineConfiguration.ThreadingModel.token, true), (.token, false), (.direct, false)])
+    func aRawImportDeliversItsResults(threadingModel: EngineConfiguration.ThreadingModel, controlled: Bool) throws {
+        let store =
+            controlled
+            ? try controlledStore(ExecutionControl())
+            : Store(engine: Engine(configuration: EngineConfiguration(threadingModel: threadingModel, features: .all)))
+        let value = V128(bytes: Array(1...16))
+        let host = Function(
+            store: store, parameters: [], results: [.v128],
+            raw: { _, _, results in
+                results[0] = .v128(value)
+            })
+        let instance = try rawImportFixture(store: store, host: host)
+        let run = try #require(instance.exports[function: "run"])
+        #expect(try run() == [.v128(value)])
+        #expect(instance.exports[global: "after"]?.value == .i32(1))
+    }
+
     /// Checks startup interruption before instantiation returns an instance to the host.
     ///
     /// - Throws: Fixture or configuration failures.
@@ -187,6 +251,42 @@ struct ExecutionInterruptionTests {
                 configuration: EngineConfiguration(
                     threadingModel: .token, compilationMode: .eager, features: .all
                 )), executionControl: control)
+    }
+
+    /// Ways a test reaches a host function that returns a `v128`.
+    enum RawImportPath: CaseIterable, Sendable {
+        /// The embedder calls the raw host function without a guest.
+        case direct
+        /// A guest calls a host function written against the array-based API.
+        case arrayImport
+        /// A guest calls the raw host function.
+        case rawImport
+    }
+
+    /// Instantiates a guest whose `run` export returns the `v128` of `env.host`.
+    ///
+    /// The guest sets its exported `after` global to 1 only after the import returns, which shows
+    /// whether any guest code ran after the call.
+    ///
+    /// - Parameters:
+    ///   - store: The store that owns `host`.
+    ///   - host: The import, which takes no parameters and returns one `v128`.
+    /// - Returns: The instance with the `run` function and the `after` global.
+    /// - Throws: Parsing or instantiation failures.
+    private func rawImportFixture(store: Store, host: Function) throws -> Instance {
+        var imports = Imports()
+        imports.define(module: "env", name: "host", host)
+        let wasm = try wat2wasm(
+            """
+            (module
+                (import "env" "host" (func $host (result v128)))
+                (global (export "after") (mut i32) (i32.const 0))
+                (func (export "run") (result v128)
+                    call $host
+                    i32.const 1
+                    global.set 0))
+            """, features: .all)
+        return try parseWasm(bytes: wasm, features: .all).instantiate(store: store, imports: imports)
     }
 
     /// Signals only after the active guest has executed at least eight checkpoints.
