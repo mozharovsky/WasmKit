@@ -1,108 +1,127 @@
-import struct SystemPackage.FileDescriptor
+// "FileSystem" trait can be turned off to support embedded platforms
+#if FileSystem
 
-public final class FileHandleStream: ByteStream {
-    private(set) public var currentIndex: Int = 0
+    extension Parser where Source == FileHandleStreamSource {
 
-    private let fileHandle: FileDescriptor
-    private let bufferLength: Int
-
-    private var endOffset: Int = 0
-    private var startOffset: Int = 0
-    private var bytes: [UInt8] = []
-
-    public init(fileHandle: FileDescriptor, bufferLength: Int = 1024 * 8) throws {
-        self.fileHandle = fileHandle
-        self.bufferLength = bufferLength
-
-        try readMoreIfNeeded()
-    }
-
-    private func readMoreIfNeeded() throws(WasmParserError) {
-        guard Int(endOffset) == currentIndex else { return }
-        startOffset = currentIndex
-
-        do {
-            let data = try fileHandle.read(upToCount: bufferLength)
-
-            bytes = [UInt8](data)
-        } catch {
-            throw WasmParserError("I/O error: \(error)", offset: currentIndex)
-        }
-        endOffset = startOffset + bytes.count
-    }
-
-    @discardableResult
-    public func consumeAny() throws(WasmParserError) -> UInt8 {
-        guard let consumed = try peek() else {
-            throw WasmParserError(message: .unexpectedEnd, offset: currentIndex)
-        }
-        currentIndex = bytes.index(after: currentIndex)
-        return consumed
-    }
-
-    @discardableResult
-    public func consume(_ expected: Set<UInt8>) throws(WasmParserError) -> UInt8 {
-        guard let consumed = try peek() else {
-            throw WasmParserError(kind: .parserUnexpectedEnd(expected: Set(expected)), offset: currentIndex)
-        }
-        guard expected.contains(consumed) else {
-            throw WasmParserError(
-                kind: .parserUnexpectedByte(
-                    consumed,
-                    expected: Set(expected)
-                ), offset: currentIndex)
-        }
-        currentIndex = bytes.index(after: currentIndex)
-        return consumed
-    }
-
-    public func consume(count: Int) throws(WasmParserError) -> ArraySlice<UInt8> {
-        let bytesToRead = currentIndex + count - endOffset
-
-        guard bytesToRead > 0 else {
-            let bytesIndex = currentIndex - startOffset
-            let result = bytes[bytesIndex..<bytesIndex + count]
-            currentIndex = currentIndex + count
-            return result
+        /// Initialize a new parser with the given file handle
+        ///
+        /// - Parameters:
+        ///   - fileHandle: A platform file descriptor for the WebAssembly binary to
+        ///     parse, opened for reading in binary mode. The parser *borrows* the
+        ///     descriptor: ownership stays with the caller, who must keep it open
+        ///     while the parser is in use and close it afterwards. Bytes are
+        ///     consumed starting from the descriptor's current offset.
+        ///   - features: Enabled WebAssembly features for parsing
+        public init(fileHandle: CInt, features: WasmFeatureSet = .default) throws {
+            self.init(stream: try FileHandleStreamSource(fileHandle: fileHandle), features: features)
         }
 
-        let data: [UInt8]
-        do {
-            data = try fileHandle.read(upToCount: bytesToRead)
-        } catch {
-            throw WasmParserError("I/O error: \(error)", offset: currentIndex)
-        }
-        guard data.count == bytesToRead else {
-            throw WasmParserError(kind: .parserUnexpectedEnd(expected: nil), offset: currentIndex)
-        }
-
-        bytes.append(contentsOf: [UInt8](data))
-        endOffset = endOffset + data.count
-
-        let bytesIndex = currentIndex - startOffset
-        let result = bytes[bytesIndex..<bytesIndex + count]
-
-        currentIndex = endOffset
-
-        return result
-    }
-
-    public func peek() throws(WasmParserError) -> UInt8? {
-        try readMoreIfNeeded()
-
-        let index = currentIndex - startOffset
-        guard bytes.indices.contains(index) else {
-            return nil
-        }
-
-        return bytes[index]
-    }
-}
-
-extension FileDescriptor {
-    fileprivate func read(upToCount maxLength: Int) throws -> [UInt8] {
-        try [UInt8](unsafeUninitializedCapacity: maxLength) { buffer, outCount in
-            outCount = try read(into: UnsafeMutableRawBufferPointer(buffer))
+        /// Initialize a new parser with the given file path
+        ///
+        /// The file is opened by the parser and closed when the underlying stream
+        /// source is deallocated.
+        ///
+        /// - Parameters:
+        ///   - filePath: The file path to the WebAssembly binary file to parse
+        ///   - features: Enabled WebAssembly features for parsing
+        public init(filePath: String, features: WasmFeatureSet = .default) throws {
+            let fileHandle = try FileIO.openForReading(path: filePath)
+            self.init(stream: try FileHandleStreamSource(fileHandle: fileHandle, ownsHandle: true), features: features)
         }
     }
-}
+
+    public final class FileHandleStreamSource: ByteStreamSource {
+        private let fileHandle: CInt
+        /// Whether this source is responsible for closing `fileHandle`.
+        /// True only when the source opened the file itself.
+        private let ownsHandle: Bool
+        private let bufferLength: Int
+
+        private var bufferEndOffset: Int = 0
+        private var bufferStartOffset: Int = 0
+        private var bytes: [UInt8] = []
+
+        /// Initialize a new stream source with the given file handle
+        ///
+        /// - Parameters:
+        ///   - fileHandle: A platform file descriptor opened for reading in binary
+        ///     mode. The stream source *borrows* the descriptor: ownership stays
+        ///     with the caller, who must keep it open for the lifetime of this
+        ///     source and close it afterwards. Bytes are consumed starting from
+        ///     the descriptor's current offset.
+        ///   - bufferLength: The size of the internal read buffer
+        public convenience init(fileHandle: CInt, bufferLength: Int = 1024 * 8) throws {
+            try self.init(fileHandle: fileHandle, ownsHandle: false, bufferLength: bufferLength)
+        }
+
+        /// Initialize a new stream source that opens the file at `filePath`
+        /// itself and closes it when the source is deallocated.
+        ///
+        /// - Parameters:
+        ///   - filePath: The path of the file to open for reading in binary mode
+        ///   - bufferLength: The size of the internal read buffer
+        public convenience init(filePath: String, bufferLength: Int = 1024 * 8) throws {
+            let fileHandle = try FileIO.openForReading(path: filePath)
+            try self.init(fileHandle: fileHandle, ownsHandle: true, bufferLength: bufferLength)
+        }
+
+        init(fileHandle: CInt, ownsHandle: Bool, bufferLength: Int = 1024 * 8) throws {
+            self.fileHandle = fileHandle
+            self.ownsHandle = ownsHandle
+            self.bufferLength = bufferLength
+
+            try readMoreIfNeeded(offset: 0)
+        }
+
+        deinit {
+            if ownsHandle {
+                FileIO.closeFile(fileHandle)
+            }
+        }
+
+        public func readByte(at offset: Int) throws(WasmParserError) -> UInt8? {
+            try readMoreIfNeeded(offset: offset)
+
+            let index = offset - bufferStartOffset
+            guard bytes.indices.contains(index) else {
+                return nil
+            }
+            return bytes[index]
+        }
+
+        public func readBytes(from startOffset: Int, to endOffset: Int) throws(WasmParserError) -> ArraySlice<UInt8>? {
+            let bytesToRead = endOffset - bufferEndOffset
+
+            if bytesToRead > 0 {
+                let data = try read(upToCount: bytesToRead)
+                // Fewer bytes than requested means the stream ended early; that is
+                // an out-of-range read, which `ByteStream` reports as needed.
+                guard data.count == bytesToRead else {
+                    return nil
+                }
+
+                bytes.append(contentsOf: data)
+                bufferEndOffset = bufferEndOffset + data.count
+            }
+
+            // `bytes` is indexed relative to `bufferStartOffset`, so translate the
+            // absolute [startOffset, endOffset) range into buffer-local indices.
+            let lowerIndex = startOffset - bufferStartOffset
+            let upperIndex = endOffset - bufferStartOffset
+            return bytes[lowerIndex..<upperIndex]
+        }
+
+        private func readMoreIfNeeded(offset: Int) throws(WasmParserError) {
+            guard Int(bufferEndOffset) == offset else { return }
+            bufferStartOffset = offset
+
+            bytes = try read(upToCount: bufferLength)
+            bufferEndOffset = bufferStartOffset + bytes.count
+        }
+
+        private func read(upToCount maxLength: Int) throws(WasmParserError) -> [UInt8] {
+            try FileIO.readBytes(fileHandle, upToCount: maxLength)
+        }
+    }
+
+#endif

@@ -125,6 +125,12 @@ enum WasmGen {
 
             extension InstructionVisitor where Self: ~Copyable {
                 /// Visits an instruction.
+                ///
+                /// Inlinable so that each concrete visitor gets its own specialized copy:
+                /// the generic one returns the visitor's error type indirectly from every
+                /// case, which allocates and probes a stack slot per case on each call.
+                @inlinable
+                @inline(never)
                 public mutating func visit(_ instruction: Instruction) throws(VisitorError) {
                     switch instruction {
 
@@ -546,7 +552,7 @@ enum WasmGen {
             var offset: Int { get }
 
             /// Claim the next byte to be decoded
-            @inlinable func claimNextByte() throws(WasmParserError) -> UInt8
+            @inlinable mutating func claimNextByte() throws(WasmParserError) -> UInt8
 
             /// Throw an error due to unknown opcode.
             func throwUnknown(_ opcode: [UInt8]) throws(WasmParserError) -> Never

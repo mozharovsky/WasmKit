@@ -1,6 +1,6 @@
 import WasmParser
 
-struct ModuleImports {
+struct ModuleImports: Sendable {
     let numberOfFunctions: Int
     let numberOfGlobals: Int
     let numberOfMemories: Int
@@ -53,7 +53,7 @@ struct ModuleImports {
 /// by calling either ``parseWasm(bytes:features:)`` or ``parseWasm(filePath:features:)``.
 /// > Note:
 /// <https://webassembly.github.io/spec/core/syntax/modules.html#modules>
-public struct Module {
+public struct Module: Sendable {
     var functions: [GuestFunction]
     let elements: [ElementSegment]
     let data: [DataSegment]
@@ -69,6 +69,9 @@ public struct Module {
     let importedFunctionTypes: [TypeIndex]
     let memoryTypes: [MemoryType]
     let tableTypes: [TableType]
+    /// The initializer of each table defined in the module, `nil` for a table
+    /// whose elements start out null.
+    let tableInitializers: [ConstExpression?]
     let tagTypes: [TypeIndex]
     let features: WasmFeatureSet
     let dataCount: UInt32?
@@ -83,7 +86,7 @@ public struct Module {
         exports: [Export],
         globals: [WasmParser.Global],
         memories: [MemoryType],
-        tables: [TableType],
+        tables: [WasmParser.Table],
         tags: [WasmParser.Tag] = [],
         customSections: [CustomSection],
         features: WasmFeatureSet,
@@ -118,8 +121,9 @@ public struct Module {
         self.types = types
         self.importedFunctionTypes = importedFunctionTypes
         self.memoryTypes = memoryTypes + memories
-        self.tableTypes = tableTypes + tables
-        self.tagTypes = tagTypes + tags.map(\.type)
+        self.tableTypes = tableTypes + tables.map(\.type)
+        self.tableInitializers = tables.map(\.initializer)
+        self.tagTypes = tagTypes + tags.map { $0.type }
     }
 
     static func resolveType(_ index: TypeIndex, typeSection: [FunctionType]) throws(WasmKitError) -> FunctionType {
@@ -162,6 +166,17 @@ public struct Module {
     ///   function also propagates termination requested through the store's execution controller.
     public func instantiate(store: Store, imports: Imports = [:]) throws -> Instance {
         Instance(handle: try self.instantiateHandle(store: store, imports: imports), store: store)
+    }
+
+    /// Returns the type of an exported function, if it exists.
+    ///
+    /// This is metadata only; it does not instantiate the module.
+    /// TODO(yuta): Revisit Module API
+    package func exportedFunctionType(named name: String) -> FunctionType? {
+        guard let export = exports.first(where: { $0.name == name }),
+            case .function(let index) = export.descriptor
+        else { return nil }
+        return try? resolveFunctionType(index)
     }
 
     #if WasmDebuggingSupport
@@ -209,63 +224,10 @@ public struct Module {
         // Step 12-13.
 
         // Steps 14-15.
-        for element in elements {
-            guard case .active(let tableIndex, let offset) = element.mode else { continue }
-            let table = try instance.tables[validating: Int(tableIndex)]
-            let offsetValue = try offset.evaluate(
-                context: constEvalContext,
-                expectedType: .addressType(isMemory64: table.limits.isMemory64)
-            )
-            try table.withValue { table in
-                guard let offset = offsetValue.maybeAddressOffset(table.limits.isMemory64) else {
-                    throw WasmKitError(
-                        kind: .message(
-                            .unexpectedOffsetInitializer(
-                                expected: .addressType(isMemory64: table.limits.isMemory64),
-                                got: offsetValue
-                            )
-                        )
-                    )
-                }
-                guard table.tableType.elementType == element.type else {
-                    throw WasmKitError(
-                        kind: .message(
-                            .elementSegmentTypeMismatch(
-                                elementType: element.type,
-                                tableElementType: table.tableType.elementType
-                            )
-                        )
-                    )
-                }
-                let references = try element.evaluateInits(context: constEvalContext)
-                try table.initialize(
-                    references, from: 0, to: Int(offset), count: references.count
-                )
-            }
-        }
+        try initializeActiveElementSegments(instance: instance, constEvalContext: constEvalContext)
 
         // Step 16.
-        for case .active(let data) in data {
-            let memory = try instance.memories[validating: Int(data.index), MemoryEntity.createOutOfBoundsError]
-            let isMemory64 = memory.withValue { $0.limit.isMemory64 }
-            let offsetValue = try data.offset.evaluate(
-                context: constEvalContext,
-                expectedType: .addressType(isMemory64: isMemory64)
-            )
-            try memory.withValue { memory in
-                guard let offset = offsetValue.maybeAddressOffset(isMemory64) else {
-                    throw WasmKitError(
-                        kind: .message(
-                            .unexpectedOffsetInitializer(
-                                expected: .addressType(isMemory64: isMemory64),
-                                got: offsetValue
-                            )
-                        )
-                    )
-                }
-                try memory.write(offset: Int(offset), bytes: data.initializer)
-            }
-        }
+        try initializeActiveDataSegments(instance: instance, constEvalContext: constEvalContext)
 
         // Step 17.
         if let startIndex = start {
@@ -286,6 +248,85 @@ public struct Module {
     /// Materialize lazily-computed elements in this module
     @available(*, deprecated, message: "Module materialization is no longer supported. Instantiate the module explicitly instead.")
     public mutating func materializeAll() throws {}
+
+    // MARK: - Segment Initialization Helpers
+
+    /// Initialize active element segments into instance tables.
+    private func initializeActiveElementSegments(
+        instance: InternalInstance, constEvalContext: ConstEvaluationContext
+    ) throws {
+        for element in elements {
+            guard case .active(let tableIndex, let offset) = element.mode else { continue }
+            let table = try instance.tables[validating: Int(tableIndex)]
+            let offsetValue = try offset.evaluate(
+                context: constEvalContext,
+                expectedType: .addressType(isMemory64: table.limits.isMemory64)
+            )
+            try table.withValue { table in
+                guard let offset = offsetValue.maybeAddressOffset(table.limits.isMemory64) else {
+                    throw WasmKitError(
+                        kind: .message(
+                            .unexpectedOffsetInitializer(
+                                expected: .addressType(isMemory64: table.limits.isMemory64),
+                                got: offsetValue
+                            )
+                        )
+                    )
+                }
+                let elementType = try instance.typeCanonicalizer.canonicalize(element.type)
+                guard elementType.isSubtype(of: table.tableType.elementType) else {
+                    throw WasmKitError(
+                        kind: .message(
+                            .elementSegmentTypeMismatch(
+                                elementType: elementType,
+                                tableElementType: table.tableType.elementType
+                            )
+                        )
+                    )
+                }
+                // A 64-bit offset that does not fit in `Int` cannot address any
+                // table, so report it as out-of-bounds instead of trapping the host.
+                guard let destination = Int(exactly: offset) else {
+                    throw Trap(.tableOutOfBounds(Int(clamping: offset)))
+                }
+                let references = try element.evaluateInits(context: constEvalContext, type: elementType)
+                try table.initialize(
+                    references, from: 0, to: destination, count: references.count
+                )
+            }
+        }
+    }
+
+    /// Initialize active data segments into instance memories.
+    private func initializeActiveDataSegments(
+        instance: InternalInstance, constEvalContext: ConstEvaluationContext
+    ) throws {
+        for case .active(let data) in self.data {
+            let memory = try instance.memories[validating: Int(data.index), MemoryEntity.createOutOfBoundsError]
+            let isMemory64 = memory.withValue { $0.limit.isMemory64 }
+            let offsetValue = try data.offset.evaluate(
+                context: constEvalContext,
+                expectedType: .addressType(isMemory64: isMemory64)
+            )
+            try memory.withValue { memory in
+                guard let offset = offsetValue.maybeAddressOffset(isMemory64) else {
+                    throw WasmKitError(
+                        kind: .message(
+                            .unexpectedOffsetInitializer(
+                                expected: .addressType(isMemory64: isMemory64),
+                                got: offsetValue
+                            )
+                        )
+                    )
+                }
+                // Ditto: an offset beyond `Int.max` is out of bounds for any memory.
+                guard let destination = Int(exactly: offset) else {
+                    throw Trap(.memoryOutOfBounds)
+                }
+                try memory.write(offset: destination, bytes: data.initializer)
+            }
+        }
+    }
 }
 
 extension Module {
@@ -324,7 +365,7 @@ typealias LabelIndex = UInt32
 /// An executable function representation in a module
 /// > Note:
 /// <https://webassembly.github.io/spec/core/syntax/modules.html#functions>
-struct GuestFunction {
+struct GuestFunction: Sendable {
     let type: FunctionType
     let code: Code
 }

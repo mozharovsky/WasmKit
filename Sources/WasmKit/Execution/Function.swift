@@ -37,6 +37,16 @@ public struct Function: Equatable {
     /// The type of a host function implementation closure.
     public typealias Implementation = (borrowing Caller, [Value]) throws -> [Value]
 
+    /// A host function that reads its parameters from, and writes its results
+    /// into, buffers the engine supplies.
+    ///
+    /// The array-based form has to allocate for every call, and on a small
+    /// device an allocation costs far more than the work most host functions
+    /// do. The buffers are valid only for the duration of the call.
+    public typealias RawImplementation = (
+        borrowing Caller, UnsafeBufferPointer<Value>, UnsafeMutableBufferPointer<Value>
+    ) throws -> Void
+
     internal let handle: InternalFunction
     let store: Store
 
@@ -71,7 +81,45 @@ public struct Function: Equatable {
         type: FunctionType,
         body: @escaping Implementation
     ) {
-        self.init(handle: store.allocator.allocate(type: type, implementation: body, engine: store.engine), store: store)
+        self.init(
+            handle: store.allocator.allocate(
+                type: type, implementation: Function.adapting(body, results: type.results),
+                engine: store.engine),
+            store: store)
+    }
+
+    /// Wraps an array-based host function in the buffer-based form the engine
+    /// calls, materialising the arrays and checking the results it returns.
+    static func adapting(
+        _ body: @escaping Implementation, results: [ValueType]
+    ) -> RawImplementation {
+        { caller, parameters, out in
+            let produced = try body(caller, Array(parameters))
+            guard produced.count == results.count else {
+                throw Trap(.resultTypesMismatch(expected: results, got: produced))
+            }
+            for index in 0..<produced.count {
+                do {
+                    try produced[index].checkType(results[index])
+                } catch {
+                    throw Trap(.resultTypesMismatch(expected: results, got: produced))
+                }
+                out[index] = produced[index]
+            }
+        }
+    }
+
+    /// Creates a function backed by a host implementation that does not
+    /// allocate to receive its parameters.
+    public init(
+        store: Store,
+        parameters: [ValueType], results: [ValueType] = [],
+        raw body: @escaping RawImplementation
+    ) {
+        let type = FunctionType(parameters: parameters, results: results)
+        self.init(
+            handle: store.allocator.allocate(type: type, implementation: body, engine: store.engine),
+            store: store)
     }
 
     /// The signature type of the function.
@@ -93,6 +141,26 @@ public struct Function: Equatable {
     @discardableResult
     public func invoke(_ arguments: [Value] = []) throws -> [Value] {
         return try handle.invoke(arguments, store: store)
+    }
+
+    /// Invokes the function on a stack the caller owns.
+    ///
+    /// ``invoke(_:)`` allocates a stack for the call and frees it again, which
+    /// is the right default but is worth avoiding when calling in repeatedly
+    /// and allocation is expensive. The stack is taken `inout` so that a host
+    /// function called from here cannot run a second guest on the same one.
+    /// A controlled store applies the same interruption checks as ``invoke(_:)``.
+    ///
+    /// - Parameters:
+    ///   - arguments: Values in the function signature's parameter order.
+    ///   - stack: The stack the guest runs on, which must have been created for this store's engine.
+    /// - Throws: A requested execution termination, a guest trap, or a host function failure.
+    /// - Returns: Values in the function signature's result order.
+    @discardableResult
+    public func invoke(
+        _ arguments: [Value] = [], on stack: inout ExecutionStack
+    ) throws -> [Value] {
+        return try handle.invoke(arguments, store: store, stack: &stack)
     }
 
     /// Invokes the function through the same store and interruption checks as ``invoke(_:)``.
@@ -191,35 +259,78 @@ extension InternalFunction {
                 arguments: arguments
             )
         } else {
-            let entity = host
-            let resolvedType = store.engine.resolveType(entity.type)
-            try check(functionType: resolvedType, parameters: arguments)
-            let caller = Caller(instanceHandle: nil, store: store)
-            do {
-                results = try entity.implementation(caller, arguments)
-            } catch {
-                try store.executionControl?.check()
-                throw error
-            }
-            try store.executionControl?.check()
-            try check(functionType: resolvedType, results: results)
+            results = try invokeHost(arguments, store: store)
         }
         try store.executionControl?.check()
         return results
     }
 
+    /// Invokes an export on a caller-owned stack with the checks of ``invoke(_:store:)``.
+    ///
+    /// - Parameters:
+    ///   - arguments: Values in the resolved function signature's parameter order.
+    ///   - store: The function's owning store, kept alive through every invocation boundary.
+    ///   - stack: The stack a guest function runs on. A host function does not use it.
+    /// - Returns: The validated results while no requested termination prevents completion.
+    /// - Throws: Requested termination, a signature mismatch, or an ordinary guest or host failure.
+    func invoke(
+        _ arguments: [Value], store: Store, stack: inout ExecutionStack
+    ) throws -> [Value] {
+        try store.executionControl?.check()
+        let results: [Value]
+        if isWasm {
+            let entity = wasm
+            let resolvedType = store.engine.resolveType(entity.type)
+            try check(functionType: resolvedType, parameters: arguments)
+            results = try executeWasm(
+                store: store,
+                function: self,
+                type: resolvedType,
+                arguments: arguments,
+                stack: &stack
+            )
+        } else {
+            // A host function does not run on the guest stack at all.
+            results = try invokeHost(arguments, store: store)
+        }
+        try store.executionControl?.check()
+        return results
+    }
+
+    /// Calls a host function from outside a guest.
+    ///
+    /// A requested stop takes precedence over the host's result, its error and result validation.
+    ///
+    /// - Parameters:
+    ///   - arguments: Values in the resolved function signature's parameter order.
+    ///   - store: The function's owning store.
+    /// - Returns: The validated results.
+    /// - Throws: Requested termination, a signature mismatch, or the host function's failure.
+    private func invokeHost(_ arguments: [Value], store: Store) throws -> [Value] {
+        let entity = host
+        let resolvedType = store.engine.resolveType(entity.type)
+        try check(functionType: resolvedType, parameters: arguments)
+        let caller = Caller(instanceHandle: nil, store: store)
+        var results = [Value](repeating: .i32(0), count: resolvedType.results.count)
+        let implementation = entity.implementation
+        do {
+            try arguments.withUnsafeBufferPointer { parameters in
+                try results.withUnsafeMutableBufferPointer { out in
+                    try implementation(caller, parameters, out)
+                }
+            }
+        } catch {
+            try store.executionControl?.check()
+            throw error
+        }
+        try store.executionControl?.check()
+        try check(functionType: resolvedType, results: results)
+        return results
+    }
+
     private func check(expectedTypes: [ValueType], values: [Value]) -> Bool {
         guard expectedTypes.count == values.count else { return false }
-        for (expected, value) in zip(expectedTypes, values) {
-            switch (expected, value) {
-            case (.i32, .i32), (.i64, .i64), (.f32, .f32), (.f64, .f64), (.v128, .v128),
-                (.ref(.funcRef), .ref(.function)), (.ref(.externRef), .ref(.extern)),
-                (.ref(.exnRef), .ref(.exception)):
-                break
-            default: return false
-            }
-        }
-        return true
+        return zip(values, expectedTypes).allSatisfy { $0.matches($1) }
     }
 
     private func check(functionType: FunctionType, parameters: [Value]) throws {
@@ -234,15 +345,32 @@ extension InternalFunction {
         }
     }
 
+    /// The compiled instruction sequence, or `nil` when there is none to point
+    /// at: a host function, or a wasm function that has not been compiled yet.
+    ///
+    /// `InternalFunction` is a tagged pointer, so reading `wasm` for a host
+    /// function reinterprets a `HostFunctionEntity` allocation as a
+    /// `WasmFunctionEntity`. Callers that cannot guarantee a compiled wasm
+    /// callee must use this instead of ``assumeCompiled()``.
+    func compiledIseq() -> InstructionSequence? {
+        guard isWasm else { return nil }
+        switch self.wasm.code {
+        case .compiled(let iseq), .debuggable(_, let iseq): return iseq
+        case .uncompiled: return nil
+        }
+    }
+
+    /// - Precondition: the callee is a wasm function and is already compiled.
+    ///   Only the engine's `internalCall` path guarantees this, because
+    ///   `compilingCall` rewrites itself to `internalCall` after compiling.
     func assumeCompiled() -> (
         InstructionSequence,
-        locals: Int,
         function: EntityHandle<WasmFunctionEntity>
     ) {
         let entity = self.wasm
         switch entity.code {
         case .compiled(let iseq), .debuggable(_, let iseq):
-            return (iseq, entity.numberOfNonParameterLocalSlots, entity)
+            return (iseq, entity)
         case .uncompiled:
             preconditionFailure()
         }
@@ -278,6 +406,10 @@ struct WasmFunctionEntity {
         let store = store.value
         let engine = store.engine
         let type = self.type
+        // A function's own type is the root frame's block type, and it does not
+        // go through `resolveBlockType`. The translator is noncopyable, so this
+        // cannot be a throw inside its `init`.
+        try engine.resolveType(type).checkFitsInterpreter()
         let iseq = try code.withValue { code in
             try InstructionTranslator(
                 allocator: store.allocator.iseqAllocator,
@@ -326,14 +458,18 @@ struct InstructionSequence {
     /// This height does not count the locals.
     let maxStackHeight: Int
 
-    /// The constant value pool associated with this instruction sequence.
-    /// See ``FrameHeaderLayout`` for how they are laid out on the stack.
-    let constants: UnsafeBufferPointer<UntypedValue>
+    /// The image a new frame's local and constant area starts out as: one zero
+    /// slot per non-parameter local slot, followed by the constant pool.
+    ///
+    /// The two halves are kept in one buffer so entering a function is a single
+    /// contiguous copy instead of a `memset` of the locals plus a `memcpy` of the
+    /// pool. See ``FrameHeaderLayout`` for how these land on the stack.
+    let frameInit: UnsafeBufferPointer<UntypedValue>
 
-    init(instructions: UnsafeMutableBufferPointer<CodeSlot>, maxStackHeight: Int, constants: UnsafeBufferPointer<UntypedValue>) {
+    init(instructions: UnsafeMutableBufferPointer<CodeSlot>, maxStackHeight: Int, frameInit: UnsafeBufferPointer<UntypedValue>) {
         self.instructions = instructions
         self.maxStackHeight = maxStackHeight
-        self.constants = constants
+        self.frameInit = frameInit
     }
 
     var baseAddress: UnsafeMutablePointer<CodeSlot> {
@@ -353,4 +489,12 @@ extension Reference {
         //       of public one in WasmTypes
         return .function(value.bitPattern)
     }
+}
+
+extension EntityHandle<WasmFunctionEntity> {
+    var type: InternedFuncType { withValue { $0.type } }
+    var instance: InternalInstance { withValue { $0.instance } }
+    var index: FunctionIndex { withValue { $0.index } }
+    var numberOfNonParameterLocalSlots: Int { withValue { $0.numberOfNonParameterLocalSlots } }
+    var code: CodeBody { withValue { $0.code } }
 }

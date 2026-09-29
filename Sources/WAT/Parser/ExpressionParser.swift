@@ -26,8 +26,12 @@ struct ExpressionParser<Visitor: InstructionVisitor> where Visitor.VisitorError 
             stack.append(name?.value)
         }
 
-        mutating func pop() {
+        /// Returns false when there is no label to pop, i.e. the source has more
+        /// `end` keywords than blocks.
+        mutating func pop() -> Bool {
+            guard !stack.isEmpty else { return false }
             stack.removeLast()
+            return true
         }
 
         mutating func peek() -> String?? {
@@ -119,7 +123,7 @@ struct ExpressionParser<Visitor: InstructionVisitor> where Visitor.VisitorError 
 
     mutating func parseWastConstInstruction(
         visitor: inout Visitor
-    ) throws(WatParserError) -> Bool where Visitor: WastConstInstructionVisitor {
+    ) throws(WatParserError) -> Bool where Visitor: WASTConstInstructionVisitor {
         var wat = Wat.empty(features: features)
         // WAST allows extra const value instruction
         if try parser.takeParenBlockStart("ref.extern") {
@@ -142,9 +146,9 @@ struct ExpressionParser<Visitor: InstructionVisitor> where Visitor.VisitorError 
         return false
     }
 
-    mutating func parseWastExpectValue() throws(WatParserError) -> WastExpectValue? {
+    mutating func parseWastExpectValue() throws(WatParserError) -> WASTExpectValue? {
         let initialParser = parser
-        func takeNaNPattern(canonical: WastExpectValue, arithmetic: WastExpectValue) throws(WatParserError) -> WastExpectValue? {
+        func takeNaNPattern(canonical: WASTExpectValue, arithmetic: WASTExpectValue) throws(WatParserError) -> WASTExpectValue? {
             if try parser.takeKeyword("nan:canonical") {
                 try parser.expect(.rightParen)
                 return canonical
@@ -154,6 +158,16 @@ struct ExpressionParser<Visitor: InstructionVisitor> where Visitor.VisitorError 
                 return arithmetic
             }
             return nil
+        }
+
+        // Relaxed-SIMD `(either <result>…)`: a non-deterministic expectation matching any candidate.
+        if try parser.takeParenBlockStart("either") {
+            var candidates: [WASTExpectValue] = []
+            while let candidate = try parseWastExpectValue() {
+                candidates.append(candidate)
+            }
+            try parser.expect(.rightParen)
+            return .either(candidates)
         }
 
         if try parser.takeParenBlockStart("v128.const") {
@@ -243,13 +257,16 @@ struct ExpressionParser<Visitor: InstructionVisitor> where Visitor.VisitorError 
 
         // WAST predication allows omitting some concrete specifiers
         if try parser.takeParenBlockStart("ref.null"), try parser.isEndOfParen() {
+            try parser.expect(.rightParen)
             return .refNull(nil)
         }
         if try parser.takeParenBlockStart("ref.func"), try parser.isEndOfParen() {
+            try parser.expect(.rightParen)
             return .refFunc(functionIndex: nil)
         }
         if try parser.takeParenBlockStart("ref.extern"), try parser.isEndOfParen() {
-            return .refFunc(functionIndex: nil)
+            try parser.expect(.rightParen)
+            return .refExtern(value: nil)
         }
         parser = initialParser
         return nil
@@ -328,7 +345,11 @@ struct ExpressionParser<Visitor: InstructionVisitor> where Visitor.VisitorError 
                     try parser.expect(.rightParen)
                 }
                 suspense = Suspense(visit: { visitor, this throws(WatParserError) in
-                    this.labelStack.pop()
+                    // An unfolded `end` inside the folded block already popped this
+                    // label, which means the source has a surplus `end`.
+                    guard this.labelStack.pop() else {
+                        throw WatParserError("unexpected `end`: no block is open here", location: nil)
+                    }
                     return try visitor.visitEnd()
                 })
             case "block", "loop", "try_table":
@@ -338,7 +359,11 @@ struct ExpressionParser<Visitor: InstructionVisitor> where Visitor.VisitorError 
                 // allows unfolded child instructions unlike others.
                 try parse(visitor: &visitor, wat: &wat)
                 suspense = Suspense(visit: { visitor, this throws(WatParserError) in
-                    this.labelStack.pop()
+                    // An unfolded `end` inside the folded block already popped this
+                    // label, which means the source has a surplus `end`.
+                    guard this.labelStack.pop() else {
+                        throw WatParserError("unexpected `end`: no block is open here", location: nil)
+                    }
                     return try visitor.visitEnd()
                 })
             default:
@@ -377,7 +402,9 @@ struct ExpressionParser<Visitor: InstructionVisitor> where Visitor.VisitorError 
         case "end":
             // This path should not be reached when parsing folded block instructions.
             try checkRepeatedLabelConsistency()
-            labelStack.pop()
+            guard labelStack.pop() else {
+                throw WatParserError("unexpected `end`: no block is open here", location: nil)
+            }
             return { visitor in
                 return try visitor.visitEnd()
             }

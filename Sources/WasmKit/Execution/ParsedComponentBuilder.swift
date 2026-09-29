@@ -1,32 +1,8 @@
 #if ComponentModel
     import ComponentModel
-    import SystemExtras
-    import SystemPackage
     import WasmParser
 
     // MARK: - Component Parsing
-
-    /// Parse a component binary file into a `ParsedComponent` ready for instantiation.
-    ///
-    /// This function reads the component from a file using streaming I/O for efficiency.
-    ///
-    /// - Parameters:
-    ///   - filePath: Path to the WebAssembly component binary file
-    ///   - features: Enabled WebAssembly features for parsing
-    /// - Returns: A `ParsedComponent` ready for instantiation
-    /// - Throws: `WasmKitError` if parsing fails, `ComponentParseError` for semantic errors
-    public func parseComponent(
-        filePath: FilePath,
-        features: WasmFeatureSet = .default
-    ) throws -> ParsedComponent {
-        let fileHandle = try FileDescriptor.open(filePath, .readOnly)
-        return try withThrowing {
-            let stream = try FileHandleStream(fileHandle: fileHandle)
-            return try parseComponent(stream: stream, features: features)
-        } defer: {
-            try fileHandle.close()
-        }
-    }
 
     /// Parse a component binary into a `ParsedComponent` ready for instantiation.
     ///
@@ -42,7 +18,7 @@
         bytes: [UInt8],
         features: WasmFeatureSet = .default
     ) throws -> ParsedComponent {
-        let stream = StaticByteStream(bytes: bytes)
+        let stream = StaticByteStreamSource(bytes: bytes)
         return try parseComponent(stream: stream, features: features)
     }
 
@@ -59,13 +35,13 @@
         bytes: ArraySlice<UInt8>,
         features: WasmFeatureSet = .default
     ) throws -> ParsedComponent {
-        let stream = StaticByteStream(bytes: bytes)
+        let stream = StaticByteStreamSource(bytes: bytes)
         return try parseComponent(stream: stream, features: features)
     }
 
     /// Internal implementation that parses from any ByteStream.
-    private func parseComponent<Stream: ByteStream>(
-        stream: Stream,
+    private func parseComponent<Source: ByteStreamSource>(
+        stream: Source,
         features: WasmFeatureSet
     ) throws -> ParsedComponent {
         var parser = WasmParser.ComponentParser(stream: stream, features: features)
@@ -619,4 +595,32 @@
         let options: [CanonicalOption]
     }
 
+#endif
+
+#if ComponentModel && FileSystem
+    /// Parse a component binary from a caller-owned platform file descriptor.
+    ///
+    /// The descriptor must be opened for reading in binary mode. This function
+    /// *borrows* it: ownership stays with the caller, who must close it after
+    /// the call returns. Bytes are consumed starting from the descriptor's
+    /// current offset.
+    public func parseComponent(
+        fileHandle: CInt,
+        features: WasmFeatureSet = .default
+    ) throws -> ParsedComponent {
+        let stream = try FileHandleStreamSource(fileHandle: fileHandle)
+        return try parseComponent(stream: stream, features: features)
+    }
+
+    /// Parse a component binary from a file path.
+    ///
+    /// The file is opened by the parser and closed when the underlying stream
+    /// source is deallocated.
+    public func parseComponent(
+        filePath: String,
+        features: WasmFeatureSet = .default
+    ) throws -> ParsedComponent {
+        let stream = try FileHandleStreamSource(filePath: filePath)
+        return try parseComponent(stream: stream, features: features)
+    }
 #endif

@@ -139,6 +139,21 @@
         )
         """
 
+    /// A load whose result reaches the add that consumes it without going through a frame slot,
+    /// followed by a store of the sum, so that a stop in the middle of the computation is
+    /// observable in linear memory.
+    private let registerHandoffWAT = """
+        (module
+          (memory 1)
+          (func $addTo (param $a i32) (param $b i32)
+            (i32.store offset=4 (local.get $b)
+              (i32.add (i32.load offset=0 (local.get $b)) (local.get $a))))
+          (func (export "_start") (result i32)
+            (i32.store offset=0 (i32.const 16) (i32.const 3))
+            (call $addTo (i32.const 2) (i32.const 16))
+            (i32.load offset=4 (i32.const 16))))
+        """
+
     /// Module with indirect call through a table.
     private let callIndirectWAT = """
         (module
@@ -320,6 +335,46 @@
         )
         """
 
+    /// Two callees; the first is called before the second.
+    private let twoCalleesWAT = """
+        (module
+          (func (export "_start") (result i32)
+            (call $first)
+            (drop)
+            (call $second))
+          (func $first (result i32)
+            (i32.const 1)
+            (i32.const 2)
+            (i32.add))
+          (func $second (result i32)
+            (i32.const 42))
+        )
+        """
+
+    /// Library export padded to an address exceeding `importingModuleWAT`.
+    private let paddedLibraryWAT = """
+        (module
+          (func $pad \(String(repeating: "(nop)", count: 200)))
+          (func (export "helper") (result i32)
+            (i32.const 7))
+        )
+        """
+
+    /// Imports a function from another binary to test address resolution with imports.
+    private let importingModuleWAT = """
+        (module
+          (import "lib" "helper" (func $helper (result i32)))
+          (func (export "_start") (result i32)
+            (call $helper)
+            (drop)
+            (call $own))
+          (func $own (result i32)
+            (i32.const 1)
+            (i32.const 2)
+            (i32.add))
+        )
+        """
+
     /// Asserts the debugger is stopped at a breakpoint, returning the wasm PC.
     @discardableResult
     private func requireBreakpoint(
@@ -359,15 +414,14 @@
             var debugger = try Debugger(module: module, store: store, imports: [:])
 
             try debugger.stopAtEntrypoint()
-            #expect(debugger.breakpoints.count == 1)
+            #expect(debugger.armedBreakpointAddresses.count == 1)
 
             try debugger.run()
-            let firstExpectedPc = try #require(debugger.breakpoints.keys.first)
+            let firstExpectedPc = try requireBreakpoint(debugger)
             #expect(debugger.currentCallStack == [firstExpectedPc])
 
             try debugger.step()
-            #expect(debugger.breakpoints.count == 1)
-            let secondExpectedPc = try #require(debugger.breakpoints.keys.first)
+            let secondExpectedPc = try requireBreakpoint(debugger)
             #expect(debugger.currentCallStack == [secondExpectedPc])
 
             #expect(firstExpectedPc < secondExpectedPc)
@@ -375,6 +429,22 @@
             try debugger.run()
             let values = try requireReturned(debugger)
             #expect(values == [.i32(42)])
+        }
+
+        /// A step must leave the guest with the state it would have had running uninterrupted, so
+        /// a value in flight between two instructions has to survive the stop between them.
+        @Test
+        func steppingPreservesAValueHeldInARegister() throws {
+            let store = Store(engine: Engine())
+            let module = try parseWasm(bytes: try wat2wasm(registerHandoffWAT))
+            var debugger = try Debugger(module: module, store: store, imports: [:])
+
+            _ = try debugger.enableBreakpoint(module: module, function: 0)
+            try debugger.run()
+            try debugger.step()
+            try debugger.run()
+
+            #expect(try requireReturned(debugger) == [.i32(5)])
         }
 
         /// Ensures that breakpoints and call stacks work across multiple function calls.
@@ -558,16 +628,15 @@
             )
         }
 
-        /// Verifies that `step` on a `call` instruction correctly steps over the call
-        /// and stops at the next instruction in the caller.
         @Test
-        func stepStepsOverCall() throws {
+        func stepEntersCall() throws {
             let store = Store(engine: Engine())
             let bytes = try wat2wasm(callWAT)
             let module = try parseWasm(bytes: bytes)
             var debugger = try Debugger(module: module, store: store, imports: [:])
 
             let startBase = module.functions[0].code.originalAddress
+            let calleeOrigin = module.functions[1].code.originalAddress  // $add_one, defined after _start
             // _start body: i32.const 10 (2) + call 1 (2) + end (1)
             let breakpointAddress = try debugger.enableBreakpoint(address: startBase + 2)
 
@@ -577,22 +646,19 @@
             try debugger.step()
             let wasmPc = try requireBreakpoint(debugger)
 
-            #expect(
-                wasmPc > breakpointAddress,
-                "step on call should advance past the call site (offset 2), got offset \(wasmPc - startBase)"
-            )
+            #expect(wasmPc >= calleeOrigin, "step on call should enter the callee at/after \(calleeOrigin), got \(wasmPc)")
+            #expect(wasmPc != breakpointAddress + 1, "must not be a step-over")
         }
 
-        /// Verifies that `step` on a `call_indirect` instruction correctly steps over
-        /// the indirect call and stops at the next instruction in the caller.
         @Test
-        func stepStepsOverCallIndirect() throws {
+        func stepEntersCallIndirect() throws {
             let store = Store(engine: Engine())
             let bytes = try wat2wasm(callIndirectWAT)
             let module = try parseWasm(bytes: bytes)
             var debugger = try Debugger(module: module, store: store, imports: [:])
 
             let startBase = module.functions[0].code.originalAddress
+            let calleeOrigin = module.functions[1].code.originalAddress  // $add_one, defined after _start
             // _start body: i32.const 10 (2) + i32.const 0 (2) + call_indirect (3) + end (1)
             let breakpointAddress = try debugger.enableBreakpoint(address: startBase + 4)
 
@@ -602,10 +668,8 @@
             try debugger.step()
             let wasmPc = try requireBreakpoint(debugger)
 
-            #expect(
-                wasmPc > breakpointAddress,
-                "step on call_indirect should advance past the call site (offset 4), got offset \(wasmPc - startBase)"
-            )
+            #expect(wasmPc >= calleeOrigin, "step on call_indirect should enter the callee at/after \(calleeOrigin), got \(wasmPc)")
+            #expect(wasmPc != breakpointAddress + 1, "must not be a step-over")
         }
 
         /// Verifies that `step` on a `return_call` (tail call) lands at the
@@ -1208,6 +1272,7 @@
             let module = try parseWasm(bytes: bytes)
             var debugger = try Debugger(module: module, store: store, imports: [:])
 
+            let requestedAddress = module.functions[1].code.originalAddress
             let breakpointAddress = try debugger.enableBreakpoint(
                 module: module,
                 function: 1
@@ -1217,15 +1282,216 @@
             #expect(try requireBreakpoint(debugger) == breakpointAddress)
 
             // Simulate lldb-dap breakpoint re-sync: remove then re-add
-            try debugger.disableBreakpoint(address: breakpointAddress)
-            try debugger.enableBreakpoint(address: breakpointAddress)
+            try debugger.disableBreakpoint(address: requestedAddress)
+            try debugger.enableBreakpoint(address: requestedAddress)
 
             // Should work fine after re-sync
             try debugger.step()
             try requireBreakpoint(debugger)
+
+            // The re-added breakpoint is still the one $factorial recurses into.
             try debugger.run()
+            #expect(try requireBreakpoint(debugger) == breakpointAddress)
+
+            try debugger.disableBreakpoint(address: requestedAddress)
+            try debugger.runPreservingCurrentBreakpoint()
             let values = try requireReturned(debugger)
             #expect(values == [.i64(6)])
+        }
+
+        // MARK: - breakpoint ownership
+
+        /// A step arms a breakpoint at every address execution can reach from the current one. Once
+        /// it has landed, and with nothing of its owner's left, the debugger has nothing to stop for.
+        @Test
+        func stepLeavesNoBreakpointBehind() throws {
+            let store = Store(engine: Engine())
+            let bytes = try wat2wasm(loopWAT)
+            let module = try parseWasm(bytes: bytes)
+            var debugger = try Debugger(module: module, store: store, imports: [:])
+
+            let base = module.functions[0].code.originalAddress
+            let breakpointAddress = try debugger.enableBreakpoint(address: base + 17)  // br_if
+
+            // First of three iterations: $i goes from 3 to 2, so the branch back is taken and the
+            // step has two possible destinations.
+            try debugger.run()
+            #expect(try requireBreakpoint(debugger) == breakpointAddress)
+
+            try debugger.step()
+            try requireBreakpoint(debugger)
+
+            try debugger.disableBreakpoint(address: breakpointAddress)
+            #expect(debugger.armedBreakpointAddresses.isEmpty)
+
+            try debugger.runPreservingCurrentBreakpoint()
+            let values = try requireReturned(debugger)
+            #expect(values == [.i32(0)])
+        }
+
+        /// A step off a breakpoint has to take it out of the bytecode to execute the instruction
+        /// under it, which is not something its owner asked for.
+        @Test
+        func stepKeepsTheBreakpointItSteppedOff() throws {
+            let store = Store(engine: Engine())
+            let bytes = try wat2wasm(loopWAT)
+            let module = try parseWasm(bytes: bytes)
+            var debugger = try Debugger(module: module, store: store, imports: [:])
+
+            let base = module.functions[0].code.originalAddress
+            let breakpointAddress = try debugger.enableBreakpoint(address: base + 17)  // br_if
+
+            try debugger.run()
+            #expect(try requireBreakpoint(debugger) == breakpointAddress)
+
+            try debugger.step()
+            #expect(debugger.armedBreakpointAddresses == [breakpointAddress])
+
+            // Second of three iterations: $i goes from 2 to 1.
+            try debugger.runPreservingCurrentBreakpoint()
+            #expect(try requireBreakpoint(debugger) == breakpointAddress)
+        }
+
+        /// Resuming single-steps off the breakpoint it resumes from. When that step lands on another
+        /// breakpoint, that is a stop rather than a slot to run through.
+        @Test
+        func resumeStopsAtABreakpointOneInstructionAway() throws {
+            let store = Store(engine: Engine())
+            let bytes = try wat2wasm(callInLoopWAT)
+            let module = try parseWasm(bytes: bytes)
+            var debugger = try Debugger(module: module, store: store, imports: [:])
+
+            let callAddress = try debugger.enableBreakpoint(
+                // _start body: i32.const 3 (2) + local.set (2) + block (2) + loop (2) + local.get (2)
+                module: module, function: 0, offsetWithinFunction: 10  // call $decrement
+            )
+            let calleeAddress = try debugger.enableBreakpoint(module: module, function: 1)
+
+            try debugger.run()
+            #expect(try requireBreakpoint(debugger) == callAddress)
+
+            try debugger.runPreservingCurrentBreakpoint()
+            #expect(try requireBreakpoint(debugger) == calleeAddress)
+        }
+
+        /// Detaching has to leave the bytecode as it found it, so that the guest runs on without a
+        /// debugger to report to.
+        @Test
+        func removingAllBreakpointsRunsToCompletion() throws {
+            let store = Store(engine: Engine())
+            let bytes = try wat2wasm(counterDemoWAT)
+            let module = try parseWasm(bytes: bytes)
+            var debugger = try Debugger(module: module, store: store, imports: [:])
+
+            _ = try debugger.enableBreakpoint(module: module, function: 1)
+            _ = try debugger.enableBreakpoint(module: module, function: 2)
+
+            try debugger.run()
+            try requireBreakpoint(debugger)
+
+            debugger.removeAllBreakpoints()
+            #expect(debugger.armedBreakpointAddresses.isEmpty)
+
+            try debugger.run()
+            let values = try requireReturned(debugger)
+            #expect(values == [.i32(2)])
+        }
+
+        // MARK: - address resolution across lazy compilation
+
+        /// Addresses that didn't emit bytecode slide forward to the next emitting instruction.
+        /// Verify the slide is bounded to the containing function.
+        @Test
+        func aBreakpointResolvesInsideTheFunctionThatContainsIt() throws {
+            let store = Store(engine: Engine())
+            let bytes = try wat2wasm(twoCalleesWAT)
+            let module = try parseWasm(bytes: bytes)
+            var debugger = try Debugger(module: module, store: store, imports: [:])
+
+            // Compile the later function first, so that the earlier one has something above it to
+            // slide into.
+            _ = try debugger.enableBreakpoint(module: module, function: 2)
+            let firstBp = try debugger.enableBreakpoint(module: module, function: 1)
+
+            #expect(firstBp >= module.functions[1].code.originalAddress)
+            #expect(firstBp < module.functions[2].code.originalBodyAddress)
+
+            // `$first` is called first, so that is where execution has to stop.
+            try debugger.run()
+            #expect(try requireBreakpoint(debugger) == firstBp)
+        }
+
+        /// DWARF's `DW_AT_low_pc` typically points to the locals declaration. Verify that a
+        /// breakpoint there resolves into the function it starts.
+        @Test
+        func aBreakpointAtAFunctionsStartResolvesIntoIt() throws {
+            let store = Store(engine: Engine())
+            let bytes = try wat2wasm(twoCalleesWAT)
+            let module = try parseWasm(bytes: bytes)
+            var debugger = try Debugger(module: module, store: store, imports: [:])
+
+            // Compile `$second` first, so the address has something above it to slide into.
+            _ = try debugger.enableBreakpoint(module: module, function: 2)
+            let firstBp = try debugger.enableBreakpoint(address: module.functions[1].code.originalBodyAddress)
+
+            #expect(firstBp >= module.functions[1].code.originalAddress)
+            #expect(firstBp < module.functions[2].code.originalBodyAddress)
+        }
+
+        /// Verify that an address past every instruction in a function does not resolve into
+        /// the next function.
+        @Test
+        func anAddressPastItsFunctionDoesNotResolveIntoTheNext() throws {
+            let store = Store(engine: Engine())
+            let bytes = try wat2wasm(twoCalleesWAT)
+            let module = try parseWasm(bytes: bytes)
+            var debugger = try Debugger(module: module, store: store, imports: [:])
+
+            // The size prefix of `$second`'s code entry: still within `$first`'s range, and past
+            // every instruction it has.
+            let past = module.functions[2].code.originalBodyAddress - 1
+            // Compile `$second` so there is something above the address to slide into.
+            _ = try debugger.enableBreakpoint(module: module, function: 2)
+
+            #expect {
+                try debugger.enableBreakpoint(address: past)
+            } throws: { error in
+                guard let error = error as? Debugger.Error,
+                    case .noInstructionMappingAvailable(let refused) = error
+                else { return false }
+                return refused == past
+            }
+        }
+
+        /// Imported function addresses are offsets into their defining binary. Verify they
+        /// do not displace this module's own addresses.
+        @Test
+        func anImportedFunctionDoesNotDisplaceThisModulesAddresses() throws {
+            let store = Store(engine: Engine())
+            let libModule = try parseWasm(bytes: try wat2wasm(paddedLibraryWAT))
+            let module = try parseWasm(bytes: try wat2wasm(importingModuleWAT))
+
+            // What makes the import's address misleading: it lies above everything in the module
+            // that imports it.
+            #expect(libModule.functions[1].code.originalBodyAddress > module.functions[1].code.originalBodyAddress)
+
+            let libInstance = try libModule.instantiate(store: store)
+            guard case .function(let helper) = libInstance.exports["helper"] else {
+                Issue.record("expected the library to export `helper`")
+                return
+            }
+            var imports = Imports()
+            imports.define(module: "lib", name: "helper", helper)
+
+            var debugger = try Debugger(module: module, store: store, imports: imports)
+            let bp = try debugger.enableBreakpoint(module: module, function: 1)
+
+            try debugger.run()
+            #expect(try requireBreakpoint(debugger) == bp)
+
+            // Stepping resolves through the same addresses.
+            try debugger.step()
+            #expect(try requireBreakpoint(debugger) > bp)
         }
     }
 

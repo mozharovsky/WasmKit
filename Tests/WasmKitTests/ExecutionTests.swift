@@ -144,4 +144,52 @@ struct ExecutionTests {
                 ])
         }
     }
+
+    /// A function body whose final `end` is followed by more operators is
+    /// malformed. The expression parser only stops at an `end` that exhausts the
+    /// code entry, so the translator has to reject the trailing operators itself
+    /// instead of translating them against the finished root frame.
+    @Test
+    func rejectsOperatorsAfterEndOfFunctionBody() throws {
+        let bytes: [UInt8] = [
+            0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,  // magic and version
+            0x01, 0x04, 0x01, 0x60, 0x00, 0x00,  // type: [0] = () -> ()
+            0x03, 0x02, 0x01, 0x00,  // function: [0] : type 0
+            // code: [0] = no locals, `end`, then a trailing `nop` and `end`
+            0x0A, 0x06, 0x01, 0x04, 0x00, 0x0B, 0x01, 0x0B,
+        ]
+        let module = try parseWasm(bytes: bytes)
+        let engine = Engine(configuration: EngineConfiguration(compilationMode: .eager))
+        let store = Store(engine: engine)
+        let error = #expect(throws: WasmKitError.self) {
+            try module.instantiate(store: store)
+        }
+        #expect(
+            error?.description.contains(#"Instruction cannot be appeared after "end" of function"#) == true,
+            "expected a validation error, got \(error.map(String.init(describing:)) ?? "no error")"
+        )
+    }
+
+    /// An `if` block can only have one `else`. A second one used to reach
+    /// `pinLabelHere` for a label the first `else` had already pinned.
+    @Test
+    func rejectsASecondElseInTheSameIfBlock() throws {
+        let bytes: [UInt8] = [
+            0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,  // magic and version
+            0x01, 0x04, 0x01, 0x60, 0x00, 0x00,  // type: [0] = () -> ()
+            0x03, 0x02, 0x01, 0x00,  // function: [0] : type 0
+            // code: [0] = no locals, `i32.const 0`, `if`, `else`, `else`, `end`, `end`
+            0x0A, 0x0B, 0x01, 0x09, 0x00, 0x41, 0x00, 0x04, 0x40, 0x05, 0x05, 0x0B, 0x0B,
+        ]
+        let module = try parseWasm(bytes: bytes)
+        let engine = Engine(configuration: EngineConfiguration(compilationMode: .eager))
+        let store = Store(engine: engine)
+        let error = #expect(throws: WasmKitError.self) {
+            try module.instantiate(store: store)
+        }
+        #expect(
+            error?.description.contains("expected `if` control frame on top of the stack for `else`") == true,
+            "expected a validation error, got \(error.map(String.init(describing:)) ?? "no error")"
+        )
+    }
 }
