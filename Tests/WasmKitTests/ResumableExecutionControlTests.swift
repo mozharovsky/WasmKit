@@ -52,6 +52,44 @@ struct ResumableExecutionControlTests {
             hosts: ["before": { _, _ in [] }, "pause": pause, "after": { _, _ in [] }])
     }
 
+    /// A guest that returns the `v128` of a raw host import, at once or after a pause.
+    ///
+    /// The `after` global becomes 1 only when guest code runs after the import returns.
+    static let rawImport = """
+        (module
+          (import "env" "pause" (func $pause))
+          (import "env" "host" (func $host (result v128)))
+          (global (export "after") (mut i32) (i32.const 0))
+          (func (export "run") (result v128)
+            (call $host)
+            (global.set 0 (i32.const 1)))
+          (func (export "pauseThenRun") (result v128)
+            (call $pause)
+            (call $host)
+            (global.set 0 (i32.const 1))))
+        """
+
+    /// Instantiates ``rawImport`` with a `pause` import that always pauses.
+    ///
+    /// - Parameters:
+    ///   - store: A token store, with or without a controller.
+    ///   - host: The body of the raw `host` import, which receives its one-element result buffer.
+    /// - Returns: The instance.
+    /// - Throws: Parsing or instantiation failures.
+    static func rawImportInstance(
+        store: Store, host: @escaping (UnsafeMutableBufferPointer<Value>) throws -> Void
+    ) throws -> Instance {
+        var imports = Imports()
+        imports.define(
+            module: "env", name: "pause",
+            Function(store: store, parameters: []) { _, _ in throw HostCallSuspension(tag: 1) })
+        imports.define(
+            module: "env", name: "host",
+            Function(store: store, parameters: [], results: [.v128], raw: { _, _, results in try host(results) }))
+        return try parseWasm(bytes: wat2wasm(rawImport, features: .all), features: .all)
+            .instantiate(store: store, imports: imports)
+    }
+
     /// Returns whether the guest wrote the memory flag at `offset`.
     static func wrote(_ fixture: Fixture, at offset: Int) throws -> Bool {
         let memory = try #require(fixture.instance.exports[memory: "memory"])
@@ -117,6 +155,53 @@ struct ResumableExecutionControlTests {
             throw HostCallSuspension(tag: 1)
         }
         #expect(throws: ExecutionTermination.interrupted) { _ = try pausing() }
+    }
+
+    /// When a resumable invocation reaches the raw import.
+    enum RawImportMoment: String, CaseIterable, Sendable {
+        case firstRun, afterAResume
+    }
+
+    @Test(arguments: RawImportMoment.allCases, [ExecutionTermination.interrupted, .deadlineExceeded])
+    func aStopOutranksTheResultsOfARawImport(
+        _ moment: RawImportMoment, _ reason: ExecutionTermination
+    ) throws {
+        let control = try ExecutionControl()
+        let store = try Store(
+            engine: Engine(configuration: EngineConfiguration(threadingModel: .token, features: .all)),
+            executionControl: control)
+        let instance = try Self.rawImportInstance(store: store) { results in
+            control.requestInterruption(reason: reason)
+            // Storing an i32 in the v128 result would fail a precondition, so the stop must come
+            // first.
+            results[0] = .i32(42)
+        }
+        let run = try #require(instance.exports[function: moment == .firstRun ? "run" : "pauseThenRun"])
+        #expect(throws: reason) {
+            switch try run.invokeResumable() {
+            case .finished(let results):
+                Issue.record("Finished with \(results)")
+            case .suspended(let call):
+                #expect(moment == .afterAResume)
+                _ = try call.resume(returning: [], in: store)
+            }
+        }
+        #expect(instance.exports[global: "after"]?.value == .i32(0))
+        #expect(store.resumableStackEnd == nil)
+    }
+
+    @Test
+    func aRawImportDeliversItsResultsAfterAResume() throws {
+        let store = try Store(
+            engine: Engine(configuration: EngineConfiguration(threadingModel: .token, features: .all)),
+            executionControl: ExecutionControl())
+        let value = V128(bytes: Array(1...16))
+        let instance = try Self.rawImportInstance(store: store) { results in results[0] = .v128(value) }
+        let run = try #require(instance.exports[function: "pauseThenRun"])
+        let call = try ResumableCallTests.suspended(try run.invokeResumable())
+        #expect(try ResumableCallTests.finished(try call.resume(returning: [], in: store)) == [.v128(value)])
+        #expect(instance.exports[global: "after"]?.value == .i32(1))
+        #expect(store.resumableStackEnd == nil)
     }
 
     @Test
