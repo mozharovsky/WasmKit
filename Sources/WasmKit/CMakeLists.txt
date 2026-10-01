@@ -41,6 +41,7 @@ add_wasmkit_library(WasmKit
   Execution/EngineInterceptor.swift
   Execution/Errors.swift
   Execution/Execution.swift
+  Execution/ExecutionControl.swift
   Execution/ExecutionStack.swift
   Execution/Function.swift
   Execution/FailableAllocation.swift
