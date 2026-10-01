@@ -140,6 +140,12 @@ Proposals are grouped by their [phase](https://github.com/WebAssembly/meetings/b
 
 Currently, the minimum supported version is Swift 6.3. When possible, our goal is to support the last two minor versions of the Swift toolchain available at the time of WasmKit's release. At the same time, development branches of WasmKit tend to adopt newer development versions of the Swift toolchain.
 
+## Cooperative execution control
+
+This fork provides a per-store stop signal for token execution. See
+[Cooperative execution control](Documentation/ExecutionControl.md) for its ownership, checkpoint,
+and native-call boundaries.
+
 ## Testing
 
 To run the WasmKit test suite, you need to checkout the test suite repositories first.
