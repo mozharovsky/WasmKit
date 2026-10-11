@@ -724,8 +724,16 @@ extension Execution {
 
     /// Starts the main execution loop using the token threading model, out of line so that every
     /// caller shares one copy of the loop.
+    ///
+    /// A controlled store runs ``runDispatchGroups(control:sp:pc:md:ms:)`` instead. Choosing it
+    /// here leaves the ordinary loop unchanged, because neither loop takes the address of the
+    /// other's registers.
     @inline(never)
     mutating func startTokenThreaded(sp: Sp, pc: Pc, md: Md, ms: Ms) throws {
+        if let control = store.value.executionControl {
+            try runDispatchGroups(control: control, sp: sp, pc: pc, md: md, ms: ms)
+            return
+        }
         var sp = sp
         var pc = pc
         var md = md
@@ -753,6 +761,65 @@ extension Execution {
             } catch let exception as WasmKitException {
                 // Through copies: taking the address of `sp` or `pc` anywhere in this loop would keep
                 // them in memory, and every instruction would store and reload them.
+                var handlerSp = sp
+                var handlerPc = pc
+                guard handleException(exception, sp: &handlerSp, pc: &handlerPc, md: &md, ms: &ms) else {
+                    throw exception
+                }
+                opcode = handlerPc.read(OpcodeID.self)
+                sp = handlerSp
+                pc = handlerPc
+            } catch let trap as Trap {
+                throw trap.withBacktrace(Self.captureBacktrace(sp: sp, pc: pc, store: store.value))
+            }
+        }
+    }
+
+    /// Polls between dispatch groups while keeping their remaining count local to this execution.
+    ///
+    /// The final partial group checks completion before exported calls or debugger resumes can
+    /// interpret EndOfExecution as a successful result. A caught guest exception is checked before
+    /// its handler runs, and the handler receives copies of the registers for the same reason as
+    /// in ``runTokenThreaded(sp:pc:md:ms:)``.
+    ///
+    /// - Parameters:
+    ///   - control: The store's immutable group policy and independently writable signal.
+    ///   - sp: The stack position of the frame execution starts in.
+    ///   - pc: The position of the first instruction to dispatch.
+    ///   - md: The cached base of the current guest linear memory.
+    ///   - ms: The cached linear-memory bound in bytes.
+    /// - Throws: Requested termination, guest traps, or uncaught host and guest failures.
+    @inline(never)
+    private mutating func runDispatchGroups(
+        control: ExecutionControl, sp: Sp, pc: Pc, md: Md, ms: Ms
+    ) throws {
+        var sp = sp
+        var pc = pc
+        var md = md
+        var ms = ms
+        #if EngineStats
+            var stats = StatsCollector()
+            defer { stats.dump() }
+        #endif
+        var opcode = pc.read(OpcodeID.self)
+        while true {
+            do {
+                while true {
+                    try control.check()
+                    var remaining = control.pollingInterval
+                    repeat {
+                        #if EngineStats
+                            stats.track(opcode)
+                        #endif
+                        opcode = try doExecute(opcode, sp: &sp, pc: &pc, md: &md, ms: &ms)
+                        remaining -= 1
+                    } while remaining != 0
+                }
+            } catch let end as EndOfExecution {
+                try control.check()
+                throw end
+            } catch let exception as WasmKitException {
+                try control.check()
                 var handlerSp = sp
                 var handlerPc = pc
                 guard handleException(exception, sp: &handlerSp, pc: &handlerPc, md: &md, ms: &ms) else {
@@ -1043,10 +1110,18 @@ extension Execution {
         return (iseq.baseAddress, newSp)
     }
 
-    /// Executes the given host function.
+    /// Invokes a host import without moving the calling frame or its program counter.
     ///
-    /// Note that this function does not modify neither the positions of the
-    /// stack pointer nor the program counter.
+    /// A requested interruption takes precedence over the native result or a thrown host error.
+    /// The controller is checked as soon as the host returns, before any result is read from its
+    /// buffer. A live store preserves the original host failure.
+    ///
+    /// - Parameters:
+    ///   - function: The imported host entity whose signature determines argument and result slots.
+    ///   - sp: The stack pointer of the calling WebAssembly frame.
+    ///   - parameterArea: The start of this call's parameter area, which holds the arguments and
+    ///     then the results.
+    /// - Throws: Requested termination, the original host failure, or a result-signature mismatch.
     @inline(never)
     private func invokeHostFunction(
         function: EntityHandle<HostFunctionEntity>, sp: Sp, parameterArea: Sp
@@ -1069,41 +1144,54 @@ extension Execution {
             store: store.value,
             sp: sp
         )
-
         // Both buffers are on the stack, so a call into the host allocates
         // nothing. A host function written against the array-based API is
         // wrapped when it is created, so there is only this one shape here.
         let implementation = function.implementation
-        try withUnsafeTemporaryAllocation(of: Value.self, capacity: parameterTypes.count) {
-            parameters throws -> Void in
-            for index in 0..<parameterTypes.count {
-                parameters.initializeElement(
-                    at: index,
-                    to: parameterArea.loadValue(
-                        at: layout.paramReg(index), type: parameterTypes[index]))
-            }
-            defer { parameters.deinitialize() }
+        // Reading the controller outside the closures keeps them from capturing the execution.
+        let executionControl = store.value.executionControl
+        do {
+            try withUnsafeTemporaryAllocation(of: Value.self, capacity: parameterTypes.count) {
+                parameters throws -> Void in
+                for index in 0..<parameterTypes.count {
+                    parameters.initializeElement(
+                        at: index,
+                        to: parameterArea.loadValue(
+                            at: layout.paramReg(index), type: parameterTypes[index]))
+                }
+                defer { parameters.deinitialize() }
 
-            // Most host functions return nothing -- every drawing call a
-            // fantasy console offers, for one -- so the result buffer and the
-            // store-back loop are skipped rather than run empty.
-            if resultTypes.isEmpty {
-                return try implementation(
-                    caller, UnsafeBufferPointer(parameters), .init(start: nil, count: 0))
-            }
-            return try withUnsafeTemporaryAllocation(of: Value.self, capacity: resultTypes.count) {
-                results throws -> Void in
-                for index in 0..<resultTypes.count {
-                    results.initializeElement(at: index, to: .i32(0))
+                // Most host functions return nothing -- every drawing call a
+                // fantasy console offers, for one -- so the result buffer and the
+                // store-back loop are skipped rather than run empty.
+                if resultTypes.isEmpty {
+                    try implementation(
+                        caller, UnsafeBufferPointer(parameters), .init(start: nil, count: 0))
+                    try executionControl?.check()
+                    return
                 }
-                defer { results.deinitialize() }
-                try implementation(caller, UnsafeBufferPointer(parameters), results)
-                for index in 0..<resultTypes.count {
-                    parameterArea.storeValue(
-                        results[index], at: layout.resultReg(index),
-                        type: resultTypes[index])
+                return try withUnsafeTemporaryAllocation(of: Value.self, capacity: resultTypes.count) {
+                    results throws -> Void in
+                    for index in 0..<resultTypes.count {
+                        results.initializeElement(at: index, to: .i32(0))
+                    }
+                    defer { results.deinitialize() }
+                    try implementation(caller, UnsafeBufferPointer(parameters), results)
+                    // A requested stop outranks the results. Storing them would first judge their
+                    // types for a guest that never reads them.
+                    try executionControl?.check()
+                    for index in 0..<resultTypes.count {
+                        parameterArea.storeValue(
+                            results[index], at: layout.resultReg(index),
+                            type: resultTypes[index])
+                    }
                 }
             }
+        } catch {
+            // A requested stop outranks the host's failure, including a result that the
+            // array-based adapter rejected.
+            try executionControl?.check()
+            throw error
         }
     }
 }

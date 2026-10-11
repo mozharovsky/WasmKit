@@ -13,7 +13,7 @@
 
     @Suite struct DebuggerWASIConfigurationTests {
         @Test func debuggeeSeesMappedPreopenAndOverriddenArgv0() async throws {
-            try await PreopenFixture.withProbeDirectory { directory in
+            try PreopenFixture.withProbeDirectory { directory in
                 let modulePath = directory.appendingPathComponent("fixture.wasm")
                 try Data(wat2wasm(PreopenFixture.fixtureSource())).write(to: modulePath)
 

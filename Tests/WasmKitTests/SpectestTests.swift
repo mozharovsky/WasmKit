@@ -52,14 +52,31 @@ struct SpectestTests {
         return try SpectestDiscovery(path: paths, exclude: exclude).discover()
     }
 
-    static func run(test: TestCase, configuration: EngineConfiguration) throws {
+    static func run(
+        test: TestCase, configuration: EngineConfiguration, executionControl: ExecutionControl? = nil
+    ) throws {
         let skip =
             UnsupportedSpectests.directives.first { test.path.hasSuffix("Vendor/testsuite/\($0.key)") }?.value ?? [:]
         try SpectestRunner(configuration: configuration)
-            .run(test: test, reporter: NullSpectestProgressReporter(), skip: skip)
+            .run(
+                test: test, reporter: NullSpectestProgressReporter(), skip: skip,
+                executionControl: executionControl)
     }
 
     #if !os(Android)
+        /// Exercises every specification case that token threading runs through a live
+        /// grouped-dispatch store.
+        ///
+        /// - Parameter test: A specification fixture with its own store and controller lifetime.
+        /// - Throws: Fixture construction or specification conformance failures.
+        @Test(arguments: try SpectestTests.testCases(in: SpectestTests.testPaths))
+        func runWithExecutionControl(test: TestCase) throws {
+            try Self.run(
+                test: test, configuration: EngineConfiguration(threadingModel: .token),
+                executionControl: ExecutionControl()
+            )
+        }
+
         @Test(
             .disabled("unable to run spectest on Android due to missing files on emulator", platforms: [.android]),
             arguments: try SpectestTests.testCases(in: SpectestTests.testPaths + SpectestTests.sharedMemoryTestPaths)
