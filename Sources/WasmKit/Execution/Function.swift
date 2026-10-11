@@ -248,6 +248,18 @@ extension InternalFunction {
         }
     }
 
+    /// Calls a host function from outside a guest.
+    ///
+    /// A call from outside a guest has no guest invocation to pause, so a ``HostCallSuspension``
+    /// fails as ``ResumableCallError/suspensionUnavailable``, as it does inside a synchronous
+    /// guest invocation.
+    ///
+    /// - Parameters:
+    ///   - arguments: Values in the resolved function signature's parameter order.
+    ///   - store: The function's owning store.
+    /// - Returns: The validated results.
+    /// - Throws: A signature mismatch, ``ResumableCallError/suspensionUnavailable``, or the host
+    ///   function's failure.
     private func invokeHost(_ arguments: [Value], store: Store) throws -> [Value] {
         let entity = host
         let resolvedType = store.engine.resolveType(entity.type)
@@ -255,10 +267,14 @@ extension InternalFunction {
         let caller = Caller(instanceHandle: nil, store: store)
         var results = [Value](repeating: .i32(0), count: resolvedType.results.count)
         let implementation = entity.implementation
-        try arguments.withUnsafeBufferPointer { parameters in
-            try results.withUnsafeMutableBufferPointer { out in
-                try implementation(caller, parameters, out)
+        do {
+            try arguments.withUnsafeBufferPointer { parameters in
+                try results.withUnsafeMutableBufferPointer { out in
+                    try implementation(caller, parameters, out)
+                }
             }
+        } catch is HostCallSuspension {
+            throw ResumableCallError.suspensionUnavailable
         }
         try check(functionType: resolvedType, results: results)
         return results
@@ -267,6 +283,16 @@ extension InternalFunction {
     private func check(expectedTypes: [ValueType], values: [Value]) -> Bool {
         guard expectedTypes.count == values.count else { return false }
         return zip(values, expectedTypes).allSatisfy { $0.matches($1) }
+    }
+
+    /// Checks arguments against a function's parameter types.
+    ///
+    /// - Parameters:
+    ///   - type: The function's signature.
+    ///   - arguments: The arguments to check.
+    /// - Throws: A trap naming the expected and the given types when they differ.
+    func checkParameters(of type: FunctionType, _ arguments: [Value]) throws {
+        try check(functionType: type, parameters: arguments)
     }
 
     private func check(functionType: FunctionType, parameters: [Value]) throws {
