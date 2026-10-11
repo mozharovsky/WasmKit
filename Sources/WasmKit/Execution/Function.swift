@@ -127,30 +127,36 @@ public struct Function: Equatable {
         store.allocator.funcTypeInterner.resolve(handle.type)
     }
 
-    /// Invokes a function of the given address with the given parameters.
+    /// Invokes the function synchronously on its owning store.
+    ///
+    /// A controlled store checks its permanent stop signal before invocation and successful
+    /// completion. After a host implementation returns or throws, a requested stop takes
+    /// precedence over host errors and result validation failures. Interruption cannot preempt
+    /// native work.
     ///
     /// - Parameters:
-    ///   - arguments: The arguments to pass to the function.
-    /// - Throws: A trap if the function invocation fails.
-    /// - Returns: The results of the function invocation.
+    ///   - arguments: Values in the function signature's parameter order.
+    /// - Throws: A requested execution termination, a guest trap, or a host function failure.
+    /// - Returns: Values in the function signature's result order.
     @discardableResult
     public func invoke(_ arguments: [Value] = []) throws -> [Value] {
         var stack = ExecutionStack(engine: store.engine)
         return try handle.invoke(arguments, store: store, stack: &stack)
     }
 
-    /// Invokes a function of the given address with the given parameters.
-    ///
-    /// - Parameter
-    ///   - arguments: The arguments to pass to the function.
-    /// - Throws: A trap if the function invocation fails.
-    /// - Returns: The results of the function invocation.
     /// Invokes the function on a stack the caller owns.
     ///
     /// ``invoke(_:)`` allocates a stack for the call and frees it again, which
     /// is the right default but is worth avoiding when calling in repeatedly
     /// and allocation is expensive. The stack is taken `inout` so that a host
     /// function called from here cannot run a second guest on the same one.
+    /// A controlled store applies the same interruption checks as ``invoke(_:)``.
+    ///
+    /// - Parameters:
+    ///   - arguments: Values in the function signature's parameter order.
+    ///   - stack: The stack the guest runs on, which must have been created for this store's engine.
+    /// - Throws: A requested execution termination, a guest trap, or a host function failure.
+    /// - Returns: Values in the function signature's result order.
     @discardableResult
     public func invoke(
         _ arguments: [Value] = [], on stack: inout ExecutionStack
@@ -158,18 +164,23 @@ public struct Function: Equatable {
         return try handle.invoke(arguments, store: store, stack: &stack)
     }
 
+    /// Invokes the function through the same store and interruption checks as ``invoke(_:)``.
+    ///
+    /// - Parameter arguments: Values in the function signature's parameter order.
+    /// - Throws: A requested execution termination, a guest trap, or a host function failure.
+    /// - Returns: Values in the function signature's result order.
     @discardableResult
     public func callAsFunction(_ arguments: [Value] = []) throws -> [Value] {
         return try invoke(arguments)
     }
 
-    /// Invokes a function of the given address with the given parameters.
+    /// Invokes the function through its owning store for callers of the deprecated runtime API.
     ///
     /// - Parameters:
-    ///   - arguments: The arguments to pass to the function.
-    ///   - runtime: The runtime to use for the function invocation.
-    /// - Throws: A trap if the function invocation fails.
-    /// - Returns: The results of the function invocation.
+    ///   - arguments: Values in the function signature's parameter order.
+    ///   - runtime: The unused legacy runtime. The function retains its own store and engine.
+    /// - Throws: A requested execution termination, a guest trap, or a host function failure.
+    /// - Returns: Values in the function signature's result order.
     @available(*, deprecated, renamed: "invoke(_:)")
     @discardableResult
     public func invoke(_ arguments: [Value] = [], runtime: Runtime) throws -> [Value] {
@@ -228,14 +239,25 @@ extension InternalFunction: ValidatableEntity {
 }
 
 extension InternalFunction {
+    /// Invokes an export on a caller-owned stack while checking native host completion before
+    /// result validation.
+    ///
+    /// - Parameters:
+    ///   - arguments: Values in the resolved function signature's parameter order.
+    ///   - store: The function's owning store, kept alive through every invocation boundary.
+    ///   - stack: The stack a guest function runs on. A host function does not use it.
+    /// - Returns: The validated results while no requested termination prevents completion.
+    /// - Throws: Requested termination, a signature mismatch, or an ordinary guest or host failure.
     func invoke(
         _ arguments: [Value], store: Store, stack: inout ExecutionStack
     ) throws -> [Value] {
+        try store.executionControl?.check()
+        let results: [Value]
         if isWasm {
             let entity = wasm
             let resolvedType = store.engine.resolveType(entity.type)
             try check(functionType: resolvedType, parameters: arguments)
-            return try executeWasm(
+            results = try executeWasm(
                 store: store,
                 function: self,
                 type: resolvedType,
@@ -244,10 +266,21 @@ extension InternalFunction {
             )
         } else {
             // A host function does not run on the guest stack at all.
-            return try invokeHost(arguments, store: store)
+            results = try invokeHost(arguments, store: store)
         }
+        try store.executionControl?.check()
+        return results
     }
 
+    /// Calls a host function from outside a guest.
+    ///
+    /// A requested stop takes precedence over the host's result, its error and result validation.
+    ///
+    /// - Parameters:
+    ///   - arguments: Values in the resolved function signature's parameter order.
+    ///   - store: The function's owning store.
+    /// - Returns: The validated results.
+    /// - Throws: Requested termination, a signature mismatch, or the host function's failure.
     private func invokeHost(_ arguments: [Value], store: Store) throws -> [Value] {
         let entity = host
         let resolvedType = store.engine.resolveType(entity.type)
@@ -255,11 +288,17 @@ extension InternalFunction {
         let caller = Caller(instanceHandle: nil, store: store)
         var results = [Value](repeating: .i32(0), count: resolvedType.results.count)
         let implementation = entity.implementation
-        try arguments.withUnsafeBufferPointer { parameters in
-            try results.withUnsafeMutableBufferPointer { out in
-                try implementation(caller, parameters, out)
+        do {
+            try arguments.withUnsafeBufferPointer { parameters in
+                try results.withUnsafeMutableBufferPointer { out in
+                    try implementation(caller, parameters, out)
+                }
             }
+        } catch {
+            try store.executionControl?.check()
+            throw error
         }
+        try store.executionControl?.check()
         try check(functionType: resolvedType, results: results)
         return results
     }

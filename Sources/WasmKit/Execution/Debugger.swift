@@ -262,14 +262,21 @@
             self.armedBreakpoints.removeAll()
         }
 
-        /// Resumes the module instantiated by the debugger stopped at a breakpoint. The lowest-level
-        /// resume: the breakpoint at the current program counter is taken out of the bytecode so that
-        /// execution can make progress, and it is not put back. Execution continues until the next
-        /// breakpoint is triggered or all remaining instructions are executed. If the module is not
-        /// stopped at a breakpoint, this function returns immediately.
+        /// Starts the entrypoint or resumes a breakpoint until execution stops or returns.
+        ///
+        /// Resuming removes the current breakpoint from the bytecode without restoring it, unless a
+        /// step already went past every breakpoint in its slot. Call only while instantiated or
+        /// stopped at a breakpoint. An exited debugger returns immediately. A controlled store
+        /// checks its signal before starting or resuming, and before it takes a breakpoint out.
+        /// Execution termination permanently prevents further guest execution on that store.
+        ///
+        /// - Throws: Requested execution termination, a guest or native failure, or invalid
+        ///   breakpoint mapping information.
         package mutating func run() throws {
             switch self.state {
             case .stoppedAtBreakpoint(let breakpoint):
+                // A rejected resume leaves the breakpoint armed.
+                try self.store.executionControl?.check()
                 // A step can already have gone past every breakpoint in this slot. None of them is at
                 // the current program counter then, so they stay for the next time execution comes by.
                 if self.hostBreakpoints[breakpoint.wasmPc]?.allSatisfy({ $0 < breakpoint.reportedPc }) == true {
@@ -307,7 +314,16 @@
 
         /// Runs the guest, recording in ``state`` how it stops: at a breakpoint, with a trap, or by
         /// returning from the entrypoint.
+        ///
+        /// Every start, resume and step runs the guest through here. A controlled store checks its
+        /// signal before the guest runs and again before a return from the entrypoint counts as
+        /// success, because a single step completes without the run loop's final check.
+        ///
+        /// - Parameter resumption: Where and how the guest runs.
+        /// - Throws: Requested execution termination, a guest or native failure, or invalid
+        ///   breakpoint mapping information.
         private mutating func resume(_ resumption: Resumption) throws {
+            try self.store.executionControl?.check()
             do {
                 switch resumption {
                 case .entrypoint:
@@ -327,6 +343,7 @@
                     try self.singleStep(from: breakpoint, reportingBreakpoint: reportingBreakpoint)
                 }
             } catch let end as Execution.EndOfExecution {
+                try self.store.executionControl?.check()
                 // The module successfully executed till the "end of execution" instruction.
                 let type = self.entrypointFunction.type
                 self.state = .entrypointReturned(
@@ -406,6 +423,7 @@
         /// handler. Breakpoints stay in the bytecode throughout, so a step leaves the host's breakpoints exactly
         /// as it found them.
         /// If the module is not stopped at a breakpoint, this function returns immediately.
+        /// A controlled store checks its signal before the step runs any guest code.
         package mutating func step() throws {
             guard case .stoppedAtBreakpoint(let breakpoint) = self.state else {
                 return
@@ -462,7 +480,7 @@
 
         /// Resumes the module instantiated by the debugger stopped at a breakpoint. The breakpoint from which
         /// the debugger resumes is preserved. If the module is current not stopped at a breakpoint, this function
-        /// returns immediately.
+        /// returns immediately. A controlled store checks its signal before any guest code runs.
         package mutating func runPreservingCurrentBreakpoint() throws {
             guard case .stoppedAtBreakpoint(let breakpoint) = self.state else {
                 return
