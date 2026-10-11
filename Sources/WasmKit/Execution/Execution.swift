@@ -1117,9 +1117,9 @@ extension Execution {
 
     /// Invokes a host import without moving the calling frame or its program counter.
     ///
-    /// A requested interruption takes precedence over the native result or a thrown host error.
-    /// The controller is checked as soon as the host returns, before any result is read from its
-    /// buffer. A live store preserves the original host failure.
+    /// A requested interruption takes precedence over the native result, a thrown host error and a
+    /// request to pause. The controller is checked as soon as the host returns, before any result
+    /// is read from its buffer. A live store preserves the original host failure.
     ///
     /// A host function that throws ``HostCallSuspension`` asks to pause the invocation at this
     /// call. `pc` is where the caller continues after the call, which a resumable invocation
@@ -1212,8 +1212,8 @@ extension Execution {
                 }
             }
         } catch {
-            // A requested stop outranks the host's failure, including a result that the
-            // array-based adapter rejected.
+            // A requested stop outranks the host's failure, a result that the array-based
+            // adapter rejected, and a request to pause.
             try executionControl?.check()
             throw error
         }

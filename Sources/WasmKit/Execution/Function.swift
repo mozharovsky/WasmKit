@@ -299,6 +299,7 @@ extension InternalFunction {
                 }
             }
         } catch is HostCallSuspension {
+            try store.executionControl?.check()
             throw ResumableCallError.suspensionUnavailable
         } catch {
             try store.executionControl?.check()
