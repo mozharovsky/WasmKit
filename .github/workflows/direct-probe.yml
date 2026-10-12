@@ -1,0 +1,129 @@
+name: Direct execution probe
+
+# Measures token, controlled token and direct dispatch on one GitHub-hosted machine per run. The
+# probe lives on its research branch only, so the workflow runs on pushes to that branch.
+on:
+  push:
+    branches: [direct-execution-probe]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: direct-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SWIFT_RELEASE: "6.4.0"
+  WASM_SDK: swift-6.4.0-RELEASE_wasm
+  WASM_SDK_SHA256: f07b7be3c586d92d7a07051fc6d303b87ebea67eadc40640ba59d5a8b79aa86d
+  TOOLCHAIN: /Library/Developer/Toolchains/swift-6.4.0-RELEASE.xctoolchain
+  BENCHMARK_DISABLE_JEMALLOC: "true"
+
+jobs:
+  phase-a:
+    runs-on: xcode-27
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load probe parameters
+        run: grep -v '^#' Benchmarks/DirectProbe/ci.env | grep . >> "$GITHUB_ENV"
+      - name: Select Xcode 27.0
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.0.app
+          xcodebuild -version
+      - name: Install the standalone Swift release and its WebAssembly SDK
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/swift.pkg" \
+            "https://download.swift.org/swift-${SWIFT_RELEASE}-release/xcode/swift-${SWIFT_RELEASE}-RELEASE/swift-${SWIFT_RELEASE}-RELEASE-osx.pkg"
+          sudo installer -pkg "$RUNNER_TEMP/swift.pkg" -target /
+          "$TOOLCHAIN/usr/bin/swift" sdk install \
+            "https://download.swift.org/swift-${SWIFT_RELEASE}-release/wasm-sdk/swift-${SWIFT_RELEASE}-RELEASE/${WASM_SDK}.artifactbundle.tar.gz" \
+            --checksum "$WASM_SDK_SHA256"
+      - name: Record the environment
+        run: |
+          mkdir -p probe-out
+          {
+            echo "commit: $(git rev-parse HEAD)"
+            echo "runner: $RUNNER_NAME image ${ImageOS:-} ${ImageVersion:-}"
+            sw_vers
+            uname -a
+            sysctl -n machdep.cpu.brand_string hw.model hw.ncpu hw.memsize
+            sysctl hw.perflevel0.physicalcpu hw.perflevel1.physicalcpu 2>/dev/null || true
+            xcodebuild -version
+            xcrun swift --version 2>&1
+            "$TOOLCHAIN/usr/bin/swift" --version 2>&1
+            "$TOOLCHAIN/usr/bin/swift" sdk list
+          } | tee probe-out/environment.txt
+      - name: Build the guest with the standalone release in Release
+        run: |
+          "$TOOLCHAIN/usr/bin/swift" build -c release --swift-sdk "$WASM_SDK" \
+            --package-path Benchmarks/DirectProbe/Guest -v > probe-out/guest-build.log 2>&1 \
+            || { tail -50 probe-out/guest-build.log; exit 1; }
+          bin=$("$TOOLCHAIN/usr/bin/swift" build -c release --swift-sdk "$WASM_SDK" \
+            --package-path Benchmarks/DirectProbe/Guest --show-bin-path)
+          cp "$bin/ProbeGuest.wasm" probe-out/ProbeGuest.wasm
+          shasum -a 256 probe-out/ProbeGuest.wasm | tee probe-out/hashes.txt
+      - name: Build the harness with Xcode in Release
+        run: |
+          xcrun swift build -c release --package-path Benchmarks/DirectProbe/Host -v \
+            > probe-out/host-build.log 2>&1 || { tail -80 probe-out/host-build.log; exit 1; }
+          bin=$(xcrun swift build -c release --package-path Benchmarks/DirectProbe/Host --show-bin-path)
+          echo "BENCH=$bin/DirectProbeBench" >> "$GITHUB_ENV"
+          shasum -a 256 "$bin/DirectProbeBench" | tee -a probe-out/hashes.txt
+      - name: Build the WasmiBenchmarks replay in Release
+        run: |
+          ./Vendor/checkout-dependency wasmi-benchmarks
+          xcrun swift build -c release --package-path Benchmarks --product WasmiBenchmarks -v \
+            > probe-out/wasmi-build.log 2>&1 || { tail -80 probe-out/wasmi-build.log; exit 1; }
+          bin=$(xcrun swift build -c release --package-path Benchmarks --show-bin-path)
+          echo "WASMI=$bin/WasmiBenchmarks" >> "$GITHUB_ENV"
+          shasum -a 256 "$bin/WasmiBenchmarks" | tee -a probe-out/hashes.txt
+          git -C Vendor/wasmi-benchmarks rev-parse HEAD | tee -a probe-out/hashes.txt
+      - name: Run phase A
+        run: |
+          python3 Benchmarks/DirectProbe/scripts/run.py \
+            --bench "$BENCH" --wasm probe-out/ProbeGuest.wasm --out probe-out/results \
+            --wasmi "$WASMI" --wasmi-root Vendor/wasmi-benchmarks \
+            --only "$PROBE_ONLY" --processes "$PROBE_PROCESSES" --rounds "$PROBE_ROUNDS" \
+            --samples "$PROBE_SAMPLES" --warmup "$PROBE_WARMUP" --cold "$PROBE_COLD" \
+            --wasmi-rounds "$PROBE_WASMI_ROUNDS" --wasmi-warmup-ms "$PROBE_WASMI_WARMUP_MS" \
+            --wasmi-measure-ms "$PROBE_WASMI_MEASURE_MS" --size "$PROBE_SIZES"
+      - name: Summarize
+        if: always()
+        run: |
+          if [ -d probe-out/results ]; then
+            python3 Benchmarks/DirectProbe/scripts/analyze.py probe-out/results | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: phase-a-${{ github.sha }}
+          path: probe-out
+
+  release-suite:
+    runs-on: xcode-27
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load probe parameters
+        run: grep -v '^#' Benchmarks/DirectProbe/ci.env | grep . >> "$GITHUB_ENV"
+      - name: Select Xcode 27.0
+        if: env.RUN_RELEASE_SUITE == '1'
+        run: sudo xcode-select -s /Applications/Xcode_27.0.app
+      - name: Install wabt and the test dependencies
+        if: env.RUN_RELEASE_SUITE == '1'
+        run: |
+          ./CI/install-wabt.sh
+          ./Vendor/checkout-dependency --category default
+      - name: Run the WasmKit suite in Release
+        if: env.RUN_RELEASE_SUITE == '1'
+        run: |
+          mkdir -p suite-out
+          set -o pipefail
+          xcrun swift test -c release -Xswiftc -enable-testing 2>&1 | tee suite-out/release-suite.log
+      - uses: actions/upload-artifact@v4
+        if: always() && env.RUN_RELEASE_SUITE == '1'
+        with:
+          name: release-suite-${{ github.sha }}
+          path: suite-out
