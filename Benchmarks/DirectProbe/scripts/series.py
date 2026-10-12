@@ -60,6 +60,7 @@ def main():
 
     if "spin" in only and platform.system() == "Darwin":
         for side, variant in [("base", "token-control"), ("base", "direct"), ("head", "direct"), ("head", "direct-control")]:
+            os.makedirs(os.path.join(out, side, "logs"), exist_ok=True)
             ok, counts = spin_proof(runner, binaries[side][0], args.wasm, variant, os.path.join(out, side))
             runner.steps[-1]["name"] = f"spin-{side}-{variant}"
 
