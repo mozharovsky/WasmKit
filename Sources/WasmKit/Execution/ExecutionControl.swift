@@ -112,7 +112,7 @@ public enum ExecutionControlError: Error, Equatable, Sendable {
     case invalidPollingInterval
     /// A controller cannot be used by more than one store, including replacement stores.
     case reusedControl
-    /// The debugger cannot run a direct-threaded store with a controller, whose debuggable code
-    /// has no checkpoints.
+    /// A direct-threaded store with a controller cannot run a debuggable instance or the debugger,
+    /// whose code has no checkpoints.
     case unsupportedThreadingModel
 }

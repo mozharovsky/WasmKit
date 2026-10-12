@@ -460,16 +460,108 @@ struct DirectExecutionControlTests {
     }
 
     #if WasmDebuggingSupport
-        /// Refuses a debugger on a controlled direct store, whose debuggable code has no checkpoint.
+        /// A module whose start function calls the `host.started` import, with an `answer` export.
+        private static let startModule = Result {
+            try parseWasm(
+                bytes: wat2wasm(
+                    """
+                    (module (import "host" "started" (func $started))
+                        (func $start (call $started)) (start $start)
+                        (func (export "_start"))
+                        (func (export "answer") (result i32) i32.const 42))
+                    """))
+        }
+
+        /// The imports of ``startModule``, whose `started` import counts its calls in `starts`.
+        private func startImports(_ store: Store, _ starts: Box<Int>) -> Imports {
+            var imports = Imports()
+            imports.define(
+                module: "host", name: "started",
+                Function(store: store, parameters: []) { _, _ in
+                    starts.value += 1
+                    return []
+                })
+            return imports
+        }
+
+        /// Refuses a debuggable instance and a debugger on a controlled direct store before the start
+        /// function runs, and leaves the store and its controller usable.
         ///
-        /// - Throws: Fixture construction or controller configuration failures.
-        @Test
-        func theDebuggerRefusesAControlledDirectStore() throws {
-            let store = try directStore(ExecutionControl())
-            let module = try parseWasm(bytes: wat2wasm("(module (func (export \"_start\")))"))
+        /// Debuggable code is translated without checkpoints, so either path would otherwise run the
+        /// guest without polling the controller.
+        ///
+        /// - Parameter path: `instance` for the public debuggable instantiation, `debugger` for the
+        ///   debugger.
+        /// - Throws: Fixture construction or invocation failures.
+        @Test(arguments: ["instance", "debugger"])
+        func debuggableCodeIsRefusedBeforeItRuns(path: String) throws {
+            let control = try ExecutionControl()
+            let store = try directStore(control)
+            let starts = Box(0)
+            let module = try Self.startModule.get()
+            let imports = startImports(store, starts)
             #expect(throws: ExecutionControlError.unsupportedThreadingModel) {
-                _ = try Debugger(module: module, store: store, imports: [:])
+                if path == "instance" {
+                    _ = try module.instantiate(store: store, imports: imports, isDebuggable: true)
+                } else {
+                    _ = try Debugger(module: module, store: store, imports: imports)
+                }
             }
+            #expect(starts.value == 0)
+            #expect(control.termination == nil)
+            let instance = try module.instantiate(store: store, imports: imports)
+            #expect(starts.value == 1)
+            let answer = try #require(instance.exports[function: "answer"])
+            #expect(try answer() == [.i32(42)])
+        }
+
+        /// A loop that counts to its argument and records how far it got.
+        private static let countModule = Result {
+            try parseWasm(
+                bytes: wat2wasm(
+                    """
+                    (module (global $done (export "done") (mut i32) (i32.const 0))
+                        (func (export "_start"))
+                        (func (export "count") (param $n i32) (local $i i32)
+                            (loop $next
+                                (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                                (br_if $next (i32.lt_u (local.get $i) (local.get $n))))
+                            (global.set $done (local.get $i))))
+                    """))
+        }
+
+        /// Keeps debuggable instances on an uncontrolled direct store and on a controlled token store,
+        /// and keeps a stop reaching the latter's loop.
+        ///
+        /// - Throws: Fixture construction or invocation failures.
+        @Test
+        func otherDebuggableStoresKeepTheirBehaviour() throws {
+            let module = try Self.countModule.get()
+            let plain = try module.instantiate(
+                store: Store(engine: Engine(configuration: EngineConfiguration(threadingModel: .direct))),
+                isDebuggable: true)
+            let plainCount = try #require(plain.exports[function: "count"])
+            _ = try plainCount([.i32(1_000)])
+            #expect(plain.exports[global: "done"]?.value == .i32(1_000))
+
+            let control = try ExecutionControl(recordsCheckpoints: true)
+            let store = try Store(
+                engine: Engine(configuration: EngineConfiguration(threadingModel: .token, memoryBoundsChecking: .software)),
+                executionControl: control)
+            let token = try module.instantiate(store: store, isDebuggable: true)
+            let count = try #require(token.exports[function: "count"])
+            try stopAfterProgress(control, reason: .interrupted) {
+                #expect(throws: ExecutionTermination.interrupted) { try count([.i32(UInt32.max)]) }
+            }
+            #expect(token.exports[global: "done"]?.value == .i32(0))
+
+            var debugger = try Debugger(
+                module: module,
+                store: Store(
+                    engine: Engine(configuration: EngineConfiguration(threadingModel: .token)),
+                    executionControl: ExecutionControl()),
+                imports: [:])
+            try debugger.run()
         }
     #endif
 
