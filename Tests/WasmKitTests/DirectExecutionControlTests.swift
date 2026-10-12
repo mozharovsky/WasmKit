@@ -317,10 +317,13 @@ struct DirectExecutionControlTests {
         return control.observedCheckpointCount
     }
 
-    /// Counts the WebAssembly operators `export` runs, with fuel metering on an uncontrolled store.
+    /// Counts the WebAssembly operators that fuel prices in a run of `export`, with fuel metering on
+    /// an uncontrolled store.
     ///
-    /// Fuel charges each region in advance, so this equals the operators executed only for code
-    /// that runs every region to its end, which the bound fixtures below do.
+    /// Fuel charges each region in advance, so this equals the priced operators executed only for
+    /// code that runs every region to its end, which the bound fixtures below do. Control also
+    /// counts the operators that fuel leaves free, so this is a lower bound of the operators the
+    /// polling interval counts.
     private func operators(_ wasm: [UInt8], _ export: String, _ arguments: [Value]) throws -> UInt64 {
         let store = Store(
             engine: Engine(configuration: EngineConfiguration(threadingModel: .direct, features: .all, fuelMetering: true)))
@@ -340,7 +343,8 @@ struct DirectExecutionControlTests {
     /// Polls exactly once per polling interval of operators in straight-line code.
     ///
     /// A fresh store starts with a full budget, and every poll charges the segment it starts, so
-    /// `n` operators split into segments of one interval poll `ceil(n / interval) - 1` times.
+    /// `n` operators split into segments of one interval poll `ceil(n / interval) - 1` times. The
+    /// body runs 20,000 operators that fuel prices and the closing `end`, which only control counts.
     ///
     /// - Parameter pollingInterval: The operators between polls.
     /// - Throws: Fixture construction or invocation failures.
@@ -348,10 +352,10 @@ struct DirectExecutionControlTests {
     func straightLineCodePollsOncePerInterval(pollingInterval: UInt32) throws {
         let body = Array(repeating: "global.get 0 i32.const 1 i32.add global.set 0", count: 5_000).joined(separator: "\n")
         let wasm = try wat2wasm("(module (global (mut i32) (i32.const 0)) (func (export \"work\") \(body)))")
-        let executed = try operators(wasm, "work", [])
-        #expect(executed == 20_000)
+        #expect(try operators(wasm, "work", []) == 20_000)
+        let counted: UInt64 = 20_000 + 1
         let interval = UInt64(pollingInterval)
-        #expect(try polls(wasm, "work", [], pollingInterval: pollingInterval) == (executed + interval - 1) / interval - 1)
+        #expect(try polls(wasm, "work", [], pollingInterval: pollingInterval) == (counted + interval - 1) / interval - 1)
     }
 
     /// Fixtures for the bound that run every region they enter to its end, so fuel counts exactly
@@ -390,10 +394,11 @@ struct DirectExecutionControlTests {
     }
 
     /// Polls at least once per polling interval of operators in loops, calls, recursion, and
-    /// branches, measured against the operators that fuel metering counts.
+    /// branches, measured against the operators that fuel metering prices.
     ///
     /// With at most `interval` operators between two polls, `n` operators make at least
-    /// `ceil(n / interval) - 1` polls.
+    /// `ceil(n / interval) - 1` polls. The operators that fuel prices are a subset of those that
+    /// control counts, so their count gives a lower bound that does not depend on the translator.
     ///
     /// - Parameters:
     ///   - export: The fixture.
@@ -457,6 +462,133 @@ struct DirectExecutionControlTests {
         // 60 frames of 200 operators, or 800 operators, at most 16 apart between polls.
         let operatorsAfter: UInt64 = shape == "unwind" ? 60 * 200 : 800
         #expect(after >= operatorsAfter / 16 - 1, "\(after) polls after the mark")
+    }
+
+    // MARK: - Operators that fuel leaves free
+
+    /// `count` copies of `text`, separated by spaces.
+    private static func repeated(_ text: String, _ count: Int) -> String {
+        Array(repeating: text, count: count).joined(separator: " ")
+    }
+
+    /// Straight-line functions made mostly of operators that fuel leaves free.
+    ///
+    /// `nops` runs 4,000 `nop`s. `mixed` runs 1,000 groups of `nop`, `i32.const`, `drop` and
+    /// `nop`, of which fuel prices only the constant. Both end with the closing `end`, which fuel
+    /// leaves free too.
+    private static let freeStraightLine = Result {
+        try wat2wasm(
+            """
+            (module
+                (func (export "nops") \(repeated("nop", 4_000)))
+                (func (export "mixed") \(repeated("nop i32.const 7 drop nop", 1_000))))
+            """)
+    }
+
+    /// Counts every `nop` and the other operators that fuel leaves free toward the polling
+    /// interval, and keeps their fuel price at zero.
+    ///
+    /// The oracle counts the operators in the source. Control counts each one, so `n` of them in
+    /// straight-line code poll `ceil(n / interval) - 1` times, as
+    /// ``straightLineCodePollsOncePerInterval(pollingInterval:)`` explains. Fuel metering of the
+    /// same code charges only the constants.
+    ///
+    /// - Parameters:
+    ///   - export: `nops` or `mixed`.
+    ///   - pollingInterval: The operators between polls.
+    /// - Throws: Fixture construction or invocation failures.
+    @Test(arguments: ["nops", "mixed"], [UInt32(16), 256])
+    func freeOperatorsCountTowardTheInterval(export: String, pollingInterval: UInt32) throws {
+        let wasm = try Self.freeStraightLine.get()
+        let counted: UInt64 = export == "nops" ? 4_000 + 1 : 4 * 1_000 + 1
+        let priced: UInt64 = export == "nops" ? 0 : 1_000
+        #expect(try operators(wasm, export, []) == priced)
+        let interval = UInt64(pollingInterval)
+        #expect(try polls(wasm, export, [], pollingInterval: pollingInterval) == (counted + interval - 1) / interval - 1)
+    }
+
+    /// The operators of a counting loop's own increment and back-edge test, all priced by fuel.
+    static let counter = """
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br_if $next (i32.lt_u (local.get $i) (local.get $n)))
+        """
+
+    /// Loops whose bodies are mostly operators that fuel leaves free, with no host call in them.
+    ///
+    /// Each iteration also runs the eight operators of ``counter``. `nops` adds 1,000 `nop`s.
+    /// `blocks` adds 250 blocks that each hold one `nop`, three operators apiece. `arms` adds 100
+    /// `if`s whose arms each hold one `nop`. Either arm runs six operators: three for the
+    /// condition, the `if`, the `nop`, and the `else` or `end` that closes the arm. Fuel prices
+    /// only the condition and the `if`.
+    private static let freeLoops = Result {
+        try wat2wasm(
+            """
+            (module
+                (func (export "nops") (param $n i32) (local $i i32)
+                    (loop $next \(repeated("nop", 1_000)) \(counter)))
+                (func (export "blocks") (param $n i32) (local $i i32)
+                    (loop $next \(repeated("(block nop)", 250)) \(counter)))
+                (func (export "arms") (param $n i32) (local $i i32)
+                    (loop $next \(repeated("(if (i32.and (local.get $i) (i32.const 1)) (then nop) (else nop))", 100)) \(counter))))
+            """)
+    }
+
+    /// Polls in loops of operators that fuel leaves free at least once per interval of them, and
+    /// keeps the fuel those loops consume.
+    ///
+    /// With at most `interval` operators between two polls, `n` operators make at least
+    /// `ceil(n / interval) - 1` polls. The operators per iteration come from the source as
+    /// ``freeLoops`` describes, and fuel prices exactly ``counter`` and the `if` conditions.
+    ///
+    /// - Parameter export: `nops`, `blocks`, or `arms`.
+    /// - Throws: Fixture construction or invocation failures.
+    @Test(arguments: ["nops", "blocks", "arms"])
+    func freeOperatorsInLoopsPollWithinTheInterval(export: String) throws {
+        let wasm = try Self.freeLoops.get()
+        let iterations: UInt64 = 2_000
+        let (perIteration, pricedPerIteration): (UInt64, UInt64) =
+            switch export {
+            case "nops": (1_000 + 8, 8)
+            case "blocks": (250 * 3 + 8, 8)
+            default: (100 * 6 + 8, 100 * 4 + 8)
+            }
+        let arguments = [Value.i32(UInt32(iterations))]
+        #expect(try operators(wasm, export, arguments) == iterations * pricedPerIteration)
+        let interval: UInt64 = 64
+        let made = try polls(wasm, export, arguments, pollingInterval: UInt32(interval))
+        let counted = iterations * perIteration
+        #expect(made >= (counted + interval - 1) / interval - 1, "\(counted) operators, \(made) polls")
+    }
+
+    /// Ends a long run of `nop`s from another thread after the guest started it.
+    ///
+    /// The fixtures call no import, so only checkpoints inside the run can see the stop. The
+    /// module is translated eagerly before the watcher starts, and the watcher waits for eight
+    /// checks before it requests the stop. `straight` sets the `count` global only after its last
+    /// `nop`, so it stays zero when a checkpoint inside the run saw the stop. `loop` never ends on
+    /// its own.
+    ///
+    /// - Parameter shape: `straight` for 100,000 `nop`s in one body, `loop` for a loop of 1,000.
+    /// - Throws: Fixture construction, export lookup, or controller configuration failures.
+    @Test(arguments: ["straight", "loop"])
+    func aStopEndsALongRunOfNops(shape: String) throws {
+        let module = try shape == "loop" ? Self.nopLoopModule.get() : Self.nopStraightModule.get()
+        try watchdog {
+            let control = try ExecutionControl(pollingInterval: 64, recordsCheckpoints: true)
+            let instance = try module.instantiate(store: directStore(control))
+            let work = try #require(instance.exports[function: "work"])
+            try stopAfterProgress(control, reason: .interrupted) {
+                #expect(throws: ExecutionTermination.interrupted) { try work() }
+            }
+            #expect(instance.exports[global: "count"]?.value == .i32(0))
+            #expect(control.termination == .interrupted)
+        }
+    }
+
+    /// The fixtures of ``aStopEndsALongRunOfNops(shape:)``, parsed once per process.
+    private static let nopLoopModule = Result { try fixture("(loop $again \(repeated("nop", 1_000)) (br $again))") }
+    private static let nopStraightModule = Result {
+        try fixture("\(repeated("nop", 100_000)) (global.set $count (i32.const 1))")
     }
 
     #if WasmDebuggingSupport

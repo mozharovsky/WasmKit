@@ -485,7 +485,7 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
         var cost: UInt64
         /// Position of the current segment's `controlCheckpoint`, when the store is checkpointed.
         var controlMeter: MetaProgramCounter? = nil
-        /// Operators translated into the current segment so far.
+        /// Operators translated into the current segment so far, counting the ones fuel leaves free.
         var controlCost: UInt64 = 0
     }
 
@@ -2820,9 +2820,14 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
     /// that moment rather than in one the operator itself opens: an `if` belongs to the region
     /// that evaluates its condition, not to the arm it guards.
     ///
-    /// The operators that generate no code give the unit back in ``refundFuelForFreeOperator()``.
-    /// Pricing this way, rather than by asking what the operator is, keeps the translator from
-    /// switching over every operator kind on a path the visitor is already dispatching on.
+    /// The operators that generate no code give the fuel unit back in
+    /// ``refundFuelForFreeOperator()``. Pricing this way, rather than by asking what the operator
+    /// is, keeps the translator from switching over every operator kind on a path the visitor is
+    /// already dispatching on.
+    ///
+    /// The control segment keeps its unit for every operator, so a checkpointed store counts each
+    /// reachable operator once. Fuel's free operators can still emit code, such as `nop` itself or
+    /// the copies and branch of an `else`, and a long run of them must still reach a checkpoint.
     ///
     /// Operators in unreachable code are not charged: the translator emits nothing for them, so
     /// charging would bill a guest for work it cannot do.
@@ -2835,17 +2840,17 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
         }
     }
 
-    /// Gives back the unit charged by ``chargeFuelForOperator()`` for an operator that generates
-    /// no code: `nop`, `drop`, `block`, `loop`, `unreachable`, `return`, `else` and `end`.
+    /// Gives back the fuel unit charged by ``chargeFuelForOperator()`` for an operator that fuel
+    /// does not price: `nop`, `drop`, `block`, `loop`, `unreachable`, `return`, `else` and `end`.
+    ///
+    /// The control segment keeps its unit, as ``chargeFuelForOperator()`` explains, so fuel's
+    /// prices and the polling interval's units differ only by these operators.
     ///
     /// Call it as the first act of the visit method, before anything that opens or closes a region
     /// or changes reachability, so that the refund lands where the charge did.
     private mutating func refundFuelForFreeOperator() {
         guard fuelRegion != nil, controlStack.isCurrentFrameReachable else { return }
         fuelRegion?.cost -= 1
-        if controlCheckpointInterval != nil {
-            fuelRegion?.controlCost -= 1
-        }
     }
 
     @discardableResult

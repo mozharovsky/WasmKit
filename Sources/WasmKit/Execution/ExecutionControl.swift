@@ -7,18 +7,24 @@ import Synchronization
 /// Parsing, translation, native imports, and blocking atomic waits require their own host policies.
 /// Interruption is observed when those operations return to an interpreter checkpoint.
 public final class ExecutionControl: Sendable {
-    /// The positive maximum number of token dispatches between external-signal polls.
+    /// The positive maximum amount of guest work between external-signal polls, in the units of the
+    /// store's threading model.
     ///
-    /// This is an operation-count policy rather than a wall-clock bound. Export entry, completion,
-    /// native import return, and caught guest exceptions also check the external signal.
-    /// A translated superinstruction can perform several WebAssembly operations in one dispatch.
+    /// A token-threaded store counts dispatches and polls between groups of at most this many. A
+    /// translated superinstruction can perform several WebAssembly operations in one dispatch.
     ///
-    /// A direct-threaded store counts WebAssembly operators instead of dispatches, one per operator
-    /// as fuel metering counts them. Its checkpoints sit at function entries, loop headers, `if`
-    /// arms, after calls, at the end labels of blocks that contain a checkpoint, and every interval
-    /// of operators within straight-line code. Each one charges its segment in advance, so from one
-    /// poll to the next the guest runs at most `pollingInterval` operators. Native work inside one
-    /// operator, such as a host import or a bulk memory operation, is not counted.
+    /// A direct-threaded store counts WebAssembly operators. Every reachable operator of a function
+    /// body counts once, including `nop`, `block`, `end` and the other operators that fuel metering
+    /// leaves free. Translation places checkpoints at function entries, loop headers, `if` arms,
+    /// after calls, at the end labels of blocks that contain a checkpoint, and every interval of
+    /// operators within straight-line code. Each one charges its segment in advance, so from one
+    /// poll to the next the guest runs at most `pollingInterval` operators. The same value therefore
+    /// allows different amounts of work under the two models.
+    ///
+    /// Neither count is a wall-clock bound. Export entry, completion, native import return, and
+    /// caught guest exceptions also check the external signal. Native work inside one operator, such
+    /// as a host import, a bulk memory operation, or an atomic wait, is not counted and is not
+    /// interrupted.
     public let pollingInterval: UInt32
     /// Whether this controller records checkpoints for cross-thread progress diagnostics.
     private let recordsCheckpoints: Bool
@@ -32,7 +38,8 @@ public final class ExecutionControl: Sendable {
     /// Creates a controller without allocating a timer or starting an execution.
     ///
     /// - Parameters:
-    ///   - pollingInterval: A value from one through UInt32.max. The default uses groups of 1,024.
+    ///   - pollingInterval: A value from one through UInt32.max, in the units
+    ///     ``pollingInterval`` describes. The default is 1,024.
     ///   - recordsCheckpoints: Enables test progress recording. Ordinary execution leaves it false.
     /// - Throws: An invalid-polling-interval error when the interval is zero.
     public init(
