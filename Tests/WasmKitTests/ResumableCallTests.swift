@@ -28,7 +28,8 @@ struct ResumableCallTests {
         ///   - features: The features the module needs.
         ///   - fuel: A fuel budget, which also enables fuel metering.
         ///   - memoryBoundsChecking: The bounds checking strategy, or nil for the platform's default.
-        ///   - executionControl: A controller to bind the store to, which requires token dispatch.
+        ///   - executionControl: A controller to bind the store to.
+        ///   - names: Whether to encode the name section, so that backtraces name the functions.
         ///   - hosts: The host functions keyed by import name. Each receives the fixture and the
         ///     arguments and returns results, or throws ``HostCallSuspension`` to pause.
         init(
@@ -38,9 +39,11 @@ struct ResumableCallTests {
             fuel: UInt64? = nil,
             memoryBoundsChecking: EngineConfiguration.MemoryBoundsChecking? = nil,
             executionControl: ExecutionControl? = nil,
+            names: Bool = false,
             hosts: [String: (Fixture, [Value]) throws -> [Value]]
         ) throws {
-            let module = try parseWasm(bytes: wat2wasm(wat, features: features), features: features)
+            let module = try parseWasm(
+                bytes: wat2wasm(wat, features: features, options: EncodeOptions(nameSection: names)), features: features)
             let engine = Engine(
                 configuration: EngineConfiguration(
                     threadingModel: threadingModel, features: features,

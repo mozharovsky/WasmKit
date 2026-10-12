@@ -1003,7 +1003,16 @@ extension Execution {
             let saved = SavedSlots(of: sp)
             Self.moveArguments(from: argumentSlots, to: parameterArea, slotCount: layout.parameterSlotCount)
             saved.store(below: newSp)
-            try invokeHostFunction(function: host, sp: newSp, parameterArea: parameterArea, pc: pc)
+            do {
+                try invokeHostFunction(function: host, sp: newSp, parameterArea: parameterArea, pc: pc)
+            } catch let trap as Trap {
+                // The dispatch loop still holds this frame's `sp` and builds the trap's backtrace
+                // from it, but the moved arguments may cover the frame's saved slots. The failed
+                // call never reads its arguments again, so the slots can be written back. Other
+                // errors leave the slots alone, since a pause continues in the moved frame.
+                saved.store(below: sp)
+                throw trap
+            }
             if let instance = newSp.currentInstance {
                 CurrentMemory.mayUpdateCurrentInstance(instance: instance, md: &md, ms: &ms)
             }
