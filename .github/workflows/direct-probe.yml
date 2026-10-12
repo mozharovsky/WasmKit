@@ -9,10 +9,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: direct-probe-${{ github.ref }}
-  cancel-in-progress: true
-
 env:
   SWIFT_RELEASE: "6.4.0"
   WASM_SDK: swift-6.4.0-RELEASE_wasm
@@ -24,6 +20,10 @@ jobs:
   phase-a:
     runs-on: xcode-27
     timeout-minutes: 180
+    # Only the timing job is replaced by a newer push. A running suite job finishes.
+    concurrency:
+      group: direct-probe-phase-a-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - name: Load probe parameters
