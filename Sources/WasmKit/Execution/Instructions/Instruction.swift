@@ -2381,6 +2381,23 @@ enum Instruction {
     /// Control-shaped so that it receives the program counter, which it records for a
     /// future resumable-call API before throwing.
     case outOfFuelTrap(NoOperand)
+    /// Charge the execution-control budget of the segment that begins here
+    /// 
+    /// Emitted only for a direct-threaded store with an execution controller, at the
+    /// heads of the regions that fuel metering charges, after calls, at the end labels
+    /// of blocks that contain a checkpoint, and every polling interval of operators in
+    /// straight-line code. The immediate is the number of operators in the segment,
+    /// counting the ones that fuel leaves free. An exhausted budget dispatches to
+    /// `controlPoll` rather than calling, so that the per-iteration charge of a loop
+    /// stays a straight-line handler.
+    case controlCheckpoint(Instruction.ControlCheckpointOperand)
+    /// Check the store's execution controller and refill its budget. Only
+    /// `controlCheckpoint` dispatches to it, and translation never emits it.
+    /// 
+    /// Control-shaped so that it receives the program counter, which already points past
+    /// the head slot of the checkpoint's successor. A live store charges the segment and
+    /// continues there.
+    case controlPoll(NoOperand)
     /// WebAssembly Core Instruction `call_ref`
     case callRef(Instruction.CallRefOperand)
     /// WebAssembly Core Instruction `return_call_ref`
@@ -3599,6 +3616,17 @@ extension Instruction {
         }
     }
 
+    struct ControlCheckpointOperand: InstructionImmediate {
+        var raw: UInt64
+        @inline(__always) static func load(from pc: inout Pc) -> Self {
+            let (raw) = pc.read((UInt64).self)
+            return Self(raw: raw)
+        }
+        @inline(__always) static func emit(to emitSlot: ((Self) -> CodeSlot) -> Void) {
+            emitSlot { $0.raw }
+        }
+    }
+
     struct CallRefOperand: InstructionImmediate {
         var callee: VReg
         var arguments: VReg
@@ -4392,6 +4420,7 @@ extension Instruction {
         case .i64Load32SWithCopy(let immediate): return immediate
         case .i64Load32UWithCopy(let immediate): return immediate
         case .consumeFuel(let immediate): return immediate
+        case .controlCheckpoint(let immediate): return immediate
         case .callRef(let immediate): return immediate
         case .returnCallRef(let immediate): return immediate
         case .refAsNonNull(let immediate): return immediate
@@ -5126,6 +5155,7 @@ extension Instruction {
         case .i64Load32SWithCopy(let immediate): immediate.emit(to: emit)
         case .i64Load32UWithCopy(let immediate): immediate.emit(to: emit)
         case .consumeFuel(let immediate): immediate.emit(to: emit)
+        case .controlCheckpoint(let immediate): immediate.emit(to: emit)
         case .callRef(let immediate): immediate.emit(to: emit)
         case .returnCallRef(let immediate): immediate.emit(to: emit)
         case .refAsNonNull(let immediate): immediate.emit(to: emit)
@@ -5871,25 +5901,27 @@ extension Instruction {
         case .i64Load32UWithCopy: return 725
         case .consumeFuel: return 726
         case .outOfFuelTrap: return 727
-        case .callRef: return 728
-        case .returnCallRef: return 729
-        case .refAsNonNull: return 730
-        case .brIfNull: return 731
-        case .brIfNotNull: return 732
-        case .selectMemory: return 733
-        default: return 734  // .selectSharedMemory
+        case .controlCheckpoint: return 728
+        case .controlPoll: return 729
+        case .callRef: return 730
+        case .returnCallRef: return 731
+        case .refAsNonNull: return 732
+        case .brIfNull: return 733
+        case .brIfNotNull: return 734
+        case .selectMemory: return 735
+        default: return 736  // .selectSharedMemory
         }
     }
 }
 extension Instruction {
     /// The number of opcodes, trap pseudo-instructions included.
-    static let opcodeCount = 735
+    static let opcodeCount = 737
 
     /// Whether only the direct-threaded dispatcher implements this instruction;
     /// `Execution.doExecute` has no case for it.
     var isDirectThreadedOnly: Bool {
         switch opcodeID {
-        case 365, 366, 367, 368, 369, 370, 371, 372, 373, 374, 375, 376, 377, 378, 379, 380, 381, 382, 383, 384, 385, 386, 387, 388, 389, 390, 391, 392, 393, 394, 395, 396, 397, 398, 399, 400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418, 419, 420, 421, 422, 423, 424, 425, 426, 427, 428, 429, 430, 431, 432, 433, 434, 435, 436, 437, 438, 439, 440, 441, 442, 443, 444, 445, 446, 447, 448, 449, 450, 451, 452, 453, 454, 455, 456, 457, 458, 459, 460, 461, 462, 463, 464, 465, 466, 467, 468, 469, 470, 471, 472, 473, 474, 475, 476, 477, 478, 479, 480, 481, 482, 483, 484, 485, 486, 487, 488, 489, 490, 491, 492, 493, 494, 495, 496, 497, 498, 499, 500, 501, 502, 503, 504, 505, 506, 507, 508, 509, 510, 511, 512, 513, 514, 515, 516, 517, 518, 519, 520, 521, 522, 523, 524, 525, 526, 527, 528, 529, 530, 531, 532, 533, 534, 535, 536, 537, 538, 539, 540, 541, 542, 543, 544, 545, 546, 547, 548, 549, 550, 551, 552, 553, 554, 555, 556, 557, 558, 559, 560, 561, 562, 563, 564, 565, 566, 567, 568, 569, 570, 571, 572, 573, 574, 575, 576, 577, 578, 579, 580, 581, 582, 583, 584, 585, 586, 587, 588, 589, 590, 591, 592, 593, 594, 595, 596, 597, 598, 599, 600, 601, 602, 603, 604, 605, 606, 607, 608, 609, 610, 611, 612, 613, 614, 615, 616, 617, 618, 619, 620, 621, 622, 623, 624, 625, 626, 627, 628, 629, 630, 631, 632, 633, 634, 635, 636, 637, 638, 639, 640, 641, 642, 643, 644, 645, 646, 647, 648, 649, 650, 651, 652, 653, 654, 655, 656, 657, 658, 659, 660, 661, 662, 663, 664, 665, 666, 667, 668, 669, 670, 671, 672, 673, 674, 675, 676, 677, 678, 679, 680, 681, 682, 683, 684, 685, 686, 687, 688, 689, 690, 691, 692, 693, 694, 695, 696, 697, 698, 699, 700, 701, 702, 703, 704, 705, 706, 707, 708, 709, 710, 711: return true
+        case 365, 366, 367, 368, 369, 370, 371, 372, 373, 374, 375, 376, 377, 378, 379, 380, 381, 382, 383, 384, 385, 386, 387, 388, 389, 390, 391, 392, 393, 394, 395, 396, 397, 398, 399, 400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418, 419, 420, 421, 422, 423, 424, 425, 426, 427, 428, 429, 430, 431, 432, 433, 434, 435, 436, 437, 438, 439, 440, 441, 442, 443, 444, 445, 446, 447, 448, 449, 450, 451, 452, 453, 454, 455, 456, 457, 458, 459, 460, 461, 462, 463, 464, 465, 466, 467, 468, 469, 470, 471, 472, 473, 474, 475, 476, 477, 478, 479, 480, 481, 482, 483, 484, 485, 486, 487, 488, 489, 490, 491, 492, 493, 494, 495, 496, 497, 498, 499, 500, 501, 502, 503, 504, 505, 506, 507, 508, 509, 510, 511, 512, 513, 514, 515, 516, 517, 518, 519, 520, 521, 522, 523, 524, 525, 526, 527, 528, 529, 530, 531, 532, 533, 534, 535, 536, 537, 538, 539, 540, 541, 542, 543, 544, 545, 546, 547, 548, 549, 550, 551, 552, 553, 554, 555, 556, 557, 558, 559, 560, 561, 562, 563, 564, 565, 566, 567, 568, 569, 570, 571, 572, 573, 574, 575, 576, 577, 578, 579, 580, 581, 582, 583, 584, 585, 586, 587, 588, 589, 590, 591, 592, 593, 594, 595, 596, 597, 598, 599, 600, 601, 602, 603, 604, 605, 606, 607, 608, 609, 610, 611, 612, 613, 614, 615, 616, 617, 618, 619, 620, 621, 622, 623, 624, 625, 626, 627, 628, 629, 630, 631, 632, 633, 634, 635, 636, 637, 638, 639, 640, 641, 642, 643, 644, 645, 646, 647, 648, 649, 650, 651, 652, 653, 654, 655, 656, 657, 658, 659, 660, 661, 662, 663, 664, 665, 666, 667, 668, 669, 670, 671, 672, 673, 674, 675, 676, 677, 678, 679, 680, 681, 682, 683, 684, 685, 686, 687, 688, 689, 690, 691, 692, 693, 694, 695, 696, 697, 698, 699, 700, 701, 702, 703, 704, 705, 706, 707, 708, 709, 710, 711, 728: return true
         default: return false
         }
     }
@@ -6634,13 +6666,15 @@ extension Instruction {
         case 725: return .i64Load32UWithCopy(Instruction.LoadWithCopyOperand.load(from: &pc))
         case 726: return .consumeFuel(Instruction.ConsumeFuelOperand.load(from: &pc))
         case 727: return .outOfFuelTrap(NoOperand())
-        case 728: return .callRef(Instruction.CallRefOperand.load(from: &pc))
-        case 729: return .returnCallRef(Instruction.ReturnCallRefOperand.load(from: &pc))
-        case 730: return .refAsNonNull(Instruction.RefAsNonNullOperand.load(from: &pc))
-        case 731: return .brIfNull(Instruction.BrIfOperand.load(from: &pc))
-        case 732: return .brIfNotNull(Instruction.BrIfOperand.load(from: &pc))
-        case 733: return .selectMemory(Instruction.SelectMemoryOperand.load(from: &pc))
-        case 734: return .selectSharedMemory(Instruction.SelectSharedMemoryOperand.load(from: &pc))
+        case 728: return .controlCheckpoint(Instruction.ControlCheckpointOperand.load(from: &pc))
+        case 729: return .controlPoll(NoOperand())
+        case 730: return .callRef(Instruction.CallRefOperand.load(from: &pc))
+        case 731: return .returnCallRef(Instruction.ReturnCallRefOperand.load(from: &pc))
+        case 732: return .refAsNonNull(Instruction.RefAsNonNullOperand.load(from: &pc))
+        case 733: return .brIfNull(Instruction.BrIfOperand.load(from: &pc))
+        case 734: return .brIfNotNull(Instruction.BrIfOperand.load(from: &pc))
+        case 735: return .selectMemory(Instruction.SelectMemoryOperand.load(from: &pc))
+        case 736: return .selectSharedMemory(Instruction.SelectSharedMemoryOperand.load(from: &pc))
         default: fatalError("Unknown instruction opcode: \(opcode)")
         }
     }
@@ -7383,13 +7417,15 @@ extension Instruction {
         case 725: return "i64Load32UWithCopy"
         case 726: return "consumeFuel"
         case 727: return "outOfFuelTrap"
-        case 728: return "callRef"
-        case 729: return "returnCallRef"
-        case 730: return "refAsNonNull"
-        case 731: return "brIfNull"
-        case 732: return "brIfNotNull"
-        case 733: return "selectMemory"
-        case 734: return "selectSharedMemory"
+        case 728: return "controlCheckpoint"
+        case 729: return "controlPoll"
+        case 730: return "callRef"
+        case 731: return "returnCallRef"
+        case 732: return "refAsNonNull"
+        case 733: return "brIfNull"
+        case 734: return "brIfNotNull"
+        case 735: return "selectMemory"
+        case 736: return "selectSharedMemory"
         default: fatalError("Unknown instruction index: \(opcode)")
         }
     }

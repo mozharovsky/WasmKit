@@ -229,10 +229,10 @@ package struct SpectestRunner {
     ///   - reporter: The synchronous receiver of directive results.
     ///   - skip: Why each directive to skip is skipped, keyed by the line it starts on.
     ///   - executionControl: An unclaimed controller for this script, or nil for an ordinary store.
-    ///     A controller requires token threading and cannot be reused after the store claims it,
-    ///     even when evaluating the script fails.
+    ///     The store polls it under either threading model. It cannot be reused after the store
+    ///     claims it, even when evaluating the script fails.
     /// - Returns: The assertion counts and recorded failures.
-    /// - Throws: Invalid controller configuration, host-module instantiation failure, or a script
+    /// - Throws: A reused controller, host-module instantiation failure, or a script
     ///   parsing failure that has no source location to record in the outcome.
     package func evaluate(
         test: TestCase, reporter: SpectestProgressReporter, skip: [Int: String] = [:],
@@ -266,7 +266,8 @@ package struct SpectestRunner {
     ///   - reporter: The synchronous receiver of progress and directive results.
     ///   - skip: Why each directive to skip is skipped, keyed by the line it starts on.
     ///   - executionControl: An unclaimed controller for this script, or nil for an ordinary store.
-    ///     A controller requires token threading and remains claimed if script execution fails.
+    ///     The store polls it under either threading model, and it remains claimed if script
+    ///     execution fails.
     /// - Throws: The failures reported by ``evaluate(test:reporter:skip:executionControl:)`` or an
     ///   aggregate error containing failed assertions.
     package func run(

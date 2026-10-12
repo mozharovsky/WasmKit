@@ -24,6 +24,7 @@ add_wasmkit_library(WasmKit
   Execution/Instructions/ControlFusedAnd.swift
   Execution/Instructions/ControlFusedFloat.swift
   Execution/Instructions/ControlFusedImm.swift
+  Execution/Instructions/ControlCheckpoint.swift
   Execution/Instructions/IntegerImmediate.swift
   Execution/Instructions/ExceptionHandling.swift
   Execution/Instructions/Fuel.swift

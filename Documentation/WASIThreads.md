@@ -32,3 +32,9 @@ long-lived embedding API. A worker trap or `proc_exit` terminates the host
 process; returning from `_start` also terminates it, allowing the operating
 system to clean up detached workers. It requires a 64-bit macOS or Linux host,
 and the `MultiThread` package trait when building the CLI product.
+
+A store with an [execution controller](ExecutionControl.md) cannot spawn workers.
+`WASIThreads.makeImports(store:)` refuses it with `WASIThreadsError.controlledStore`
+before it builds any import, because each worker runs in a fresh `Store` that a
+stop of the spawning store would not reach. Shared memories and atomics remain
+available to a controlled direct-threaded store.

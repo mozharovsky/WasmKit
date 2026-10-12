@@ -187,7 +187,10 @@ public struct Module: Sendable {
         ///     (breakpoints etc) after instantiation.
         /// - Returns: The instance after its start function and any requested eager compilation complete.
         /// - Throws: Module validation, import, allocation, start-function, or eager-compilation failures. A start
-        ///   function also propagates termination requested through the store's execution controller.
+        ///   function also propagates termination requested through the store's execution controller. A
+        ///   debuggable instance on a direct-threaded store with an execution controller is refused with
+        ///   ``ExecutionControlError/unsupportedThreadingModel`` before validation, because its code has no
+        ///   checkpoints to poll the controller at.
         public func instantiate(store: Store, imports: Imports = [:], isDebuggable: Bool) throws -> Instance {
             Instance(handle: try self.instantiateHandle(store: store, imports: imports, isDebuggable: isDebuggable), store: store)
         }
@@ -196,6 +199,11 @@ public struct Module: Sendable {
     /// > Note:
     /// <https://webassembly.github.io/spec/core/exec/modules.html#instantiation>
     private func instantiateHandle(store: Store, imports: Imports, isDebuggable: Bool = false) throws -> InternalInstance {
+        // A debuggable instance is translated without direct-only instructions, so a controlled
+        // direct store would run its code without a checkpoint.
+        if isDebuggable, store.executionControl != nil, store.engine.configuration.threadingModel == .direct {
+            throw ExecutionControlError.unsupportedThreadingModel
+        }
         try ModuleValidator(module: self).validate()
 
         // Steps 5-8.

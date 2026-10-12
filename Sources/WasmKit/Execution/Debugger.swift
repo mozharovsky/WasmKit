@@ -102,7 +102,16 @@
         ///   - module: Wasm module to instantiate.
         ///   - store: Store that instantiates the module.
         ///   - imports: Imports required by `module` for instantiation.
+        /// - Throws: ``ExecutionControlError/unsupportedThreadingModel`` for a direct-threaded store
+        ///   with an execution controller, before any guest code runs. Otherwise the failures of
+        ///   debuggable instantiation, or ``Error/entrypointFunctionNotFound``.
         package init(module: Module, store: Store, imports: Imports) throws {
+            // A debuggable instance is translated without direct-only instructions, so a direct
+            // run loop would have no checkpoint to poll the controller at. Debuggable
+            // instantiation refuses the same stores, and this check refuses them first.
+            if store.executionControl != nil, store.engine.configuration.threadingModel == .direct {
+                throw ExecutionControlError.unsupportedThreadingModel
+            }
             let limit = store.engine.configuration.stackSize / MemoryLayout<StackSlot>.stride
             let instance = try module.instantiate(store: store, imports: imports, isDebuggable: true)
 

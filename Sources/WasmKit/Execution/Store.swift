@@ -97,27 +97,50 @@ public final class Store {
     /// The optional external stop signal fixed for this store's entire lifetime.
     let executionControl: ExecutionControl?
 
+    /// Whether an execution controller is bound to this store.
+    ///
+    /// Package modules read it to refuse work that would run guest code in another store, which a
+    /// stop of this one would not reach.
+    package var hasExecutionControl: Bool { executionControl != nil }
+
+    /// The operators a direct-threaded controlled store may still run before it reads its
+    /// controller again.
+    ///
+    /// The checkpoints that translation places for such a store charge their segment's operator
+    /// count here, and an exhausted budget dispatches to the poll that refills it. In a ``Cell``
+    /// for the same reason as ``remainingFuel``. Token-threaded and uncontrolled stores never read it.
+    /// The budget carries across calls, nested host entries and resumable pauses, and only a poll
+    /// refills it.
+    let controlBudget: Cell<UInt64>
+
     /// Create a new store associated with the given engine.
     public init(engine: Engine) {
         self.engine = engine
         self.allocator = StoreAllocator(funcTypeInterner: engine.funcTypeInterner)
         self.isFuelMetered = engine.configuration.fuelMetering
         self.executionControl = nil
+        self.controlBudget = Cell(0)
     }
 
-    /// Creates a token store whose controller remains reachable outside its busy executor.
+    /// Creates a store whose controller remains reachable outside its busy executor.
+    ///
+    /// A token-threaded store polls between dispatch groups. A direct-threaded store polls at
+    /// checkpoints that translation places in the guest code, at most one polling interval of
+    /// operators apart. Debuggable instances, whose code has no checkpoints, are refused on a
+    /// direct-threaded store with a controller. See ``ExecutionControl/pollingInterval`` for the
+    /// units of each model.
     ///
     /// - Parameters:
-    ///   - engine: The engine configured for token threading.
+    ///   - engine: The engine, with either threading model.
     ///   - executionControl: An unclaimed signal retained for this store's complete lifetime.
-    /// - Throws: Unsupported threading or a controller already claimed by another store.
+    /// - Throws: A controller already claimed by another store.
     public init(engine: Engine, executionControl: ExecutionControl) throws(ExecutionControlError) {
-        guard engine.configuration.threadingModel == .token else { throw .unsupportedThreadingModel }
         try executionControl.claim()
         self.engine = engine
         self.allocator = StoreAllocator(funcTypeInterner: engine.funcTypeInterner)
         self.isFuelMetered = engine.configuration.fuelMetering
         self.executionControl = executionControl
+        self.controlBudget = Cell(UInt64(executionControl.pollingInterval))
     }
 }
 

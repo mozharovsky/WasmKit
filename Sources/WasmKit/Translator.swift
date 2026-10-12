@@ -473,11 +473,20 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
     /// instruction at its head whose immediate is the summed cost of the operators inside it.
     /// The cost is only known once the region has been translated, so the instruction is emitted
     /// with a zero immediate and patched at `meter` when the region closes.
+    ///
+    /// A direct-threaded store with an execution controller reuses the same regions for its
+    /// polling checkpoints. Their `controlCheckpoint` sits right after the fuel meter. A region is
+    /// further split into segments, each with a checkpoint of its own, as ``startControlSegment()``
+    /// describes.
     fileprivate struct FuelRegion {
-        /// Position of the region's `consumeFuel` instruction.
-        let meter: MetaProgramCounter
+        /// Position of the region's `consumeFuel` instruction, when the engine meters fuel.
+        let meter: MetaProgramCounter?
         /// Summed cost of the operators translated into this region so far.
         var cost: UInt64
+        /// Position of the current segment's `controlCheckpoint`, when the store is checkpointed.
+        var controlMeter: MetaProgramCounter? = nil
+        /// Operators translated into the current segment so far, counting the ones fuel leaves free.
+        var controlCost: UInt64 = 0
     }
 
     struct ControlStack {
@@ -512,6 +521,11 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
             fileprivate var fuelRegion: FuelRegion? = nil
             /// The enclosing region, saved while this frame's region is the current one.
             fileprivate var enclosingFuelRegion: FuelRegion? = nil
+            /// The number of control checkpoints emitted before this frame began.
+            ///
+            /// A frame that ends with a different count contains a checkpoint, so a branch to its
+            /// end label can arrive from another segment, and the code after it starts a new one.
+            var controlSegmentsAtEntry: Int = 0
 
             var copyTypes: [ValueType] {
                 switch self.kind {
@@ -2561,8 +2575,17 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
     let funcTypeInterner: Interner<FunctionType>
     let engineConfiguration: EngineConfiguration
     var module: InternalInstance
-    /// The fuel region being translated, when the engine meters fuel; `nil` otherwise.
+    /// The fuel region being translated, or nil when the engine meters no fuel and the store is
+    /// not checkpointed.
     private var fuelRegion: FuelRegion?
+    /// The polling interval of the store's controller, or nil when this function does not poll
+    /// through `controlCheckpoint` instructions.
+    ///
+    /// Only a direct-threaded store with a controller is checkpointed. A token-threaded store polls
+    /// between dispatch groups instead, and a debuggable instance emits no direct-only instruction.
+    private let controlCheckpointInterval: UInt64?
+    /// The number of control checkpoints emitted so far in this function.
+    private var controlSegmentCount = 0
     private var iseqBuilder: ISeqBuilder
     var controlStack: ControlStack
     var valueStack: ValueStack
@@ -2643,7 +2666,8 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
         locals: [WasmTypes.ValueType],
         functionIndex: FunctionIndex,
         codeSize: Int,
-        isIntercepting: Bool
+        isIntercepting: Bool,
+        controlPollingInterval: UInt32? = nil
     ) throws(WasmKitError) {
         self.allocator = allocator
         self.funcTypeInterner = funcTypeInterner
@@ -2651,6 +2675,8 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
         self.type = type
         self.module = module
         self.iseqBuilder = ISeqBuilder(engineConfiguration: engineConfiguration, isDebuggable: module.isDebuggable)
+        self.controlCheckpointInterval =
+            iseqBuilder.emitsDirectOnlyInstructions ? controlPollingInterval.map { UInt64($0) } : nil
         self.controlStack = ControlStack()
         let locals = try module.typeCanonicalizer.canonicalize(locals)
         self.stackLayout = try StackLayout(
@@ -2708,14 +2734,23 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
     /// frame on top of the stack, which must be the frame that owns the region, so that
     /// ``closeFuelRegion(of:)`` can give it its final cost when that frame ends.
     private mutating func openFuelRegion() {
-        guard engineConfiguration.fuelMetering else { return }
-        let meter = iseqBuilder.insertingPC
-        emit(.consumeFuel(Instruction.ConsumeFuelOperand(raw: 0)))
+        guard engineConfiguration.fuelMetering || controlCheckpointInterval != nil else { return }
+        var meter: MetaProgramCounter? = nil
+        if engineConfiguration.fuelMetering {
+            meter = iseqBuilder.insertingPC
+            emit(.consumeFuel(Instruction.ConsumeFuelOperand(raw: 0)))
+        }
+        var controlMeter: MetaProgramCounter? = nil
+        if controlCheckpointInterval != nil {
+            controlMeter = iseqBuilder.insertingPC
+            emit(.controlCheckpoint(Instruction.ControlCheckpointOperand(raw: 0)))
+            controlSegmentCount += 1
+        }
         // A peephole fusion that rewound past the meter would drop the charge and leave the
         // patch position pointing at unrelated code, so put it out of the rewinder's reach.
         iseqBuilder.resetLastEmission()
         let enclosing = fuelRegion
-        let region = FuelRegion(meter: meter, cost: 0)
+        let region = FuelRegion(meter: meter, cost: 0, controlMeter: controlMeter)
         fuelRegion = region
         controlStack.setCurrentFuelRegion(region, enclosing: enclosing)
     }
@@ -2724,8 +2759,59 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
     /// current again. Does nothing for a frame that shares its parent's meter.
     private mutating func closeFuelRegion(of frame: ControlStack.ControlFrame) {
         guard frame.fuelRegion != nil, let region = fuelRegion else { return }
-        iseqBuilder.patch(at: region.meter, .consumeFuel(Instruction.ConsumeFuelOperand(raw: region.cost)))
+        patchMeters(of: region)
         fuelRegion = frame.enclosingFuelRegion
+    }
+
+    /// Writes the final costs of `region` into its fuel meter and its current control checkpoint.
+    private mutating func patchMeters(of region: FuelRegion) {
+        if let meter = region.meter {
+            iseqBuilder.patch(at: meter, .consumeFuel(Instruction.ConsumeFuelOperand(raw: region.cost)))
+        }
+        if let controlMeter = region.controlMeter {
+            iseqBuilder.patch(
+                at: controlMeter, .controlCheckpoint(Instruction.ControlCheckpointOperand(raw: region.controlCost)))
+        }
+    }
+
+    /// Ends the current control segment and starts another with a checkpoint at the insertion
+    /// point.
+    ///
+    /// Segments are what make the polling bound exact. Code is entered only at a segment's
+    /// checkpoint, so the operators run between two checkpoints never exceed the first one's
+    /// charge. A new segment therefore starts wherever execution can arrive after another
+    /// checkpoint ran. That is after a call returns, after a nested region ends, and at the end
+    /// label of a frame that contains a checkpoint. The checkpoint is emitted between two
+    /// operators and out of the rewinder's reach, like a region's meter, so no fusion and no
+    /// accumulator hand-off spans it.
+    private mutating func startControlSegment() {
+        guard controlCheckpointInterval != nil, var region = fuelRegion, let controlMeter = region.controlMeter else {
+            return
+        }
+        iseqBuilder.patch(
+            at: controlMeter, .controlCheckpoint(Instruction.ControlCheckpointOperand(raw: region.controlCost)))
+        region.controlMeter = iseqBuilder.insertingPC
+        region.controlCost = 0
+        emit(.controlCheckpoint(Instruction.ControlCheckpointOperand(raw: 0)))
+        iseqBuilder.resetLastEmission()
+        fuelRegion = region
+        controlSegmentCount += 1
+    }
+
+    /// Starts a new segment once the current one holds a polling interval of operators, so that
+    /// straight-line code reaches a checkpoint too.
+    private mutating func splitControlSegmentIfFull() {
+        guard let interval = controlCheckpointInterval, let region = fuelRegion, region.controlMeter != nil,
+            region.controlCost >= interval
+        else { return }
+        startControlSegment()
+    }
+
+    /// Starts a new segment for the code a call returns to, which the callee's checkpoints may
+    /// have polled before.
+    private mutating func startControlSegmentAfterCall() {
+        guard controlCheckpointInterval != nil, controlStack.isCurrentFrameReachable else { return }
+        startControlSegment()
     }
 
     /// Prices the operator about to be translated at one unit, in the region being translated.
@@ -2734,19 +2820,31 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
     /// that moment rather than in one the operator itself opens: an `if` belongs to the region
     /// that evaluates its condition, not to the arm it guards.
     ///
-    /// The operators that generate no code give the unit back in ``refundFuelForFreeOperator()``.
-    /// Pricing this way, rather than by asking what the operator is, keeps the translator from
-    /// switching over every operator kind on a path the visitor is already dispatching on.
+    /// The operators that generate no code give the fuel unit back in
+    /// ``refundFuelForFreeOperator()``. Pricing this way, rather than by asking what the operator
+    /// is, keeps the translator from switching over every operator kind on a path the visitor is
+    /// already dispatching on.
+    ///
+    /// The control segment keeps its unit for every operator, so a checkpointed store counts each
+    /// reachable operator once. Fuel's free operators can still emit code, such as `nop` itself or
+    /// the copies and branch of an `else`, and a long run of them must still reach a checkpoint.
     ///
     /// Operators in unreachable code are not charged: the translator emits nothing for them, so
     /// charging would bill a guest for work it cannot do.
     private mutating func chargeFuelForOperator() {
         guard fuelRegion != nil, controlStack.isCurrentFrameReachable else { return }
         fuelRegion?.cost += 1
+        if controlCheckpointInterval != nil {
+            splitControlSegmentIfFull()
+            fuelRegion?.controlCost += 1
+        }
     }
 
-    /// Gives back the unit charged by ``chargeFuelForOperator()`` for an operator that generates
-    /// no code: `nop`, `drop`, `block`, `loop`, `unreachable`, `return`, `else` and `end`.
+    /// Gives back the fuel unit charged by ``chargeFuelForOperator()`` for an operator that fuel
+    /// does not price: `nop`, `drop`, `block`, `loop`, `unreachable`, `return`, `else` and `end`.
+    ///
+    /// The control segment keeps its unit, as ``chargeFuelForOperator()`` explains, so fuel's
+    /// prices and the polling interval's units differ only by these operators.
     ///
     /// Call it as the first act of the visit method, before anything that opens or closes a region
     /// or changes reachability, so that the refund lands where the charge did.
@@ -3122,7 +3220,7 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
         // The function body's region closes here rather than in `visitEnd`, which returns for the
         // root frame without popping it.
         if let region = fuelRegion {
-            iseqBuilder.patch(at: region.meter, .consumeFuel(Instruction.ConsumeFuelOperand(raw: region.cost)))
+            patchMeters(of: region)
             fuelRegion = nil
         }
         let instructions = iseqBuilder.finalize()
@@ -3255,7 +3353,8 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
                 slotStackHeight: stackHeight.slotHeight,
                 continuation: endLabel,
                 kind: .block,
-                initializedLocalsHeight: initializedLocals.count
+                initializedLocalsHeight: initializedLocals.count,
+                controlSegmentsAtEntry: controlSegmentCount
             )
         )
     }
@@ -3280,7 +3379,8 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
                 slotStackHeight: stackHeight.slotHeight,
                 continuation: headLabel,
                 kind: .loop,
-                initializedLocalsHeight: initializedLocals.count
+                initializedLocalsHeight: initializedLocals.count,
+                controlSegmentsAtEntry: controlSegmentCount
             )
         )
         // After the label, so that the back-edge lands on the meter and every iteration is
@@ -3312,7 +3412,8 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
                 slotStackHeight: stackHeight.slotHeight,
                 continuation: endLabel,
                 kind: .if(elseLabel: elseLabel, endLabel: endLabel, isElse: false),
-                initializedLocalsHeight: initializedLocals.count
+                initializedLocalsHeight: initializedLocals.count,
+                controlSegmentsAtEntry: controlSegmentCount
             )
         )
         // The `then` arm is its own region, and it must be metered after the conditional branch
@@ -3455,6 +3556,12 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
         // A loop body, a `then` without an `else`, or an `else`: whichever region this frame
         // opened is complete, so its meter gets the cost accumulated for it.
         closeFuelRegion(of: toBePopped)
+        // The end label was pinned above, so a branch to it lands on this checkpoint.
+        if controlCheckpointInterval != nil, controlSegmentCount != toBePopped.controlSegmentsAtEntry,
+            controlStack.isCurrentFrameReachable
+        {
+            startControlSegment()
+        }
     }
 
     private static func computePopCount(
@@ -4019,10 +4126,12 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
             spAddend = LVReg(slotIndex: spAddendSlotIndex)
             if module.isSameInstance(wasm.instance) {
                 emit(.compilingCall(Instruction.CallOperand(callee: callee, arguments: arguments, spAddend: spAddend)))
+                startControlSegmentAfterCall()
                 return
             }
         }
         emit(.call(Instruction.CallOperand(callee: callee, arguments: arguments, spAddend: spAddend)))
+        startControlSegmentAfterCall()
     }
 
     mutating func visitCallIndirect(typeIndex: UInt32, tableIndex: UInt32) throws(WasmKitError) -> Output {
@@ -4040,6 +4149,7 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
             arguments: arguments
         )
         emit(.callIndirect(operand))
+        startControlSegmentAfterCall()
     }
 
     /// Pops the arguments of a tail call onto the value stack, and returns where
@@ -4233,7 +4343,8 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
                 slotStackHeight: stackHeight.slotHeight,
                 continuation: endLabel,
                 kind: .tryTable(catchCount: catchCount),
-                initializedLocalsHeight: initializedLocals.count
+                initializedLocalsHeight: initializedLocals.count,
+                controlSegmentsAtEntry: controlSegmentCount
             )
         )
     }
@@ -5214,6 +5325,7 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
         guard let arguments = try visitCallLike(calleeType: calleeType) else { return }
         guard let callee else { return }
         emit(.callRef(Instruction.CallRefOperand(callee: callee, arguments: arguments)))
+        startControlSegmentAfterCall()
     }
 
     mutating func visitReturnCallRef(typeIndex: UInt32) throws(WasmKitError) -> Output {
