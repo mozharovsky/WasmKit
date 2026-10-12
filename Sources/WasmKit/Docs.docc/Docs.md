@@ -118,6 +118,17 @@ See [examples](https://github.com/swiftwasm/WasmKit/tree/main/Examples) for exec
 - ``GuestPointee``
 - ``GuestPrimitivePointee``
 
+### Resumable Host Calls
+
+- ``Function/invokeResumable(_:)``
+- ``HostCallSuspension``
+- ``ResumableCall``
+- ``SuspendedCall``
+- ``ResumeResult``
+- ``ResumeRejection``
+- ``SuspensionID``
+- ``ResumableCallError``
+
 ### Component Model
 
 - ``CanonicalLifting``

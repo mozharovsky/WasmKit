@@ -45,6 +45,16 @@ public final class Store {
     /// grows the call and throw handlers noticeably, even though they never read it.
     var fuelTrapPC: UnsafeRawPointer? = nil
 
+    /// The stack end of the resumable invocation running on this store, or nil when none runs.
+    ///
+    /// Only that invocation may pause at a host call. A synchronous call nested in one of its host
+    /// functions runs on another stack, so its host functions cannot pause the outer invocation.
+    var resumableStackEnd: UnsafeMutablePointer<StackSlot>? = nil
+    /// The identity that suspension identifiers of this store retain.
+    let suspensionIdentity = SuspensionStoreIdentity()
+    /// The serial number of the last suspension on this store.
+    var lastSuspensionSerial: UInt64 = 0
+
     /// The remaining execution budget of this store, or `nil` when execution is unlimited.
     /// (Default: `nil`)
     ///
