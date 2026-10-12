@@ -379,6 +379,10 @@ extension VMGen.ImmediateLayout {
         $0.field(name: "raw", type: .UInt64)
     }
 
+    static let controlCheckpoint = Self(name: "ControlCheckpointOperand") {
+        $0.field(name: "raw", type: .UInt64)
+    }
+
     // `arguments` is the slot of the first argument, i.e. the start of the
     // callee's parameter area, and `spAddend` is the callee's `sp` when it is
     // a Wasm function: `arguments` plus its `StackLayout.entryOffset`.

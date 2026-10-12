@@ -473,11 +473,20 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
     /// instruction at its head whose immediate is the summed cost of the operators inside it.
     /// The cost is only known once the region has been translated, so the instruction is emitted
     /// with a zero immediate and patched at `meter` when the region closes.
+    ///
+    /// A direct-threaded store with an execution controller reuses the same regions for its
+    /// polling checkpoints. Their `controlCheckpoint` sits right after the fuel meter, and a long
+    /// region is split into segments of at most one polling interval of operators, each with a
+    /// checkpoint of its own, so that straight-line code also reaches one.
     fileprivate struct FuelRegion {
-        /// Position of the region's `consumeFuel` instruction.
-        let meter: MetaProgramCounter
+        /// Position of the region's `consumeFuel` instruction, when the engine meters fuel.
+        let meter: MetaProgramCounter?
         /// Summed cost of the operators translated into this region so far.
         var cost: UInt64
+        /// Position of the current segment's `controlCheckpoint`, when the store is checkpointed.
+        var controlMeter: MetaProgramCounter? = nil
+        /// Operators translated into the current segment so far.
+        var controlCost: UInt64 = 0
     }
 
     struct ControlStack {
@@ -2561,8 +2570,15 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
     let funcTypeInterner: Interner<FunctionType>
     let engineConfiguration: EngineConfiguration
     var module: InternalInstance
-    /// The fuel region being translated, when the engine meters fuel; `nil` otherwise.
+    /// The fuel region being translated, when the engine meters fuel or the store is
+    /// checkpointed; `nil` otherwise.
     private var fuelRegion: FuelRegion?
+    /// The polling interval of the store's controller, when this function polls through
+    /// `controlCheckpoint` instructions; `nil` otherwise.
+    ///
+    /// Only a direct-threaded store with a controller is checkpointed. A token-threaded store polls
+    /// between dispatch groups instead, and a debuggable instance emits no direct-only instruction.
+    private let controlCheckpointInterval: UInt64?
     private var iseqBuilder: ISeqBuilder
     var controlStack: ControlStack
     var valueStack: ValueStack
@@ -2643,7 +2659,8 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
         locals: [WasmTypes.ValueType],
         functionIndex: FunctionIndex,
         codeSize: Int,
-        isIntercepting: Bool
+        isIntercepting: Bool,
+        controlPollingInterval: UInt32? = nil
     ) throws(WasmKitError) {
         self.allocator = allocator
         self.funcTypeInterner = funcTypeInterner
@@ -2651,6 +2668,8 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
         self.type = type
         self.module = module
         self.iseqBuilder = ISeqBuilder(engineConfiguration: engineConfiguration, isDebuggable: module.isDebuggable)
+        self.controlCheckpointInterval =
+            iseqBuilder.emitsDirectOnlyInstructions ? controlPollingInterval.map { UInt64($0) } : nil
         self.controlStack = ControlStack()
         let locals = try module.typeCanonicalizer.canonicalize(locals)
         self.stackLayout = try StackLayout(
@@ -2708,14 +2727,22 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
     /// frame on top of the stack, which must be the frame that owns the region, so that
     /// ``closeFuelRegion(of:)`` can give it its final cost when that frame ends.
     private mutating func openFuelRegion() {
-        guard engineConfiguration.fuelMetering else { return }
-        let meter = iseqBuilder.insertingPC
-        emit(.consumeFuel(Instruction.ConsumeFuelOperand(raw: 0)))
+        guard engineConfiguration.fuelMetering || controlCheckpointInterval != nil else { return }
+        var meter: MetaProgramCounter? = nil
+        if engineConfiguration.fuelMetering {
+            meter = iseqBuilder.insertingPC
+            emit(.consumeFuel(Instruction.ConsumeFuelOperand(raw: 0)))
+        }
+        var controlMeter: MetaProgramCounter? = nil
+        if controlCheckpointInterval != nil {
+            controlMeter = iseqBuilder.insertingPC
+            emit(.controlCheckpoint(Instruction.ControlCheckpointOperand(raw: 0)))
+        }
         // A peephole fusion that rewound past the meter would drop the charge and leave the
         // patch position pointing at unrelated code, so put it out of the rewinder's reach.
         iseqBuilder.resetLastEmission()
         let enclosing = fuelRegion
-        let region = FuelRegion(meter: meter, cost: 0)
+        let region = FuelRegion(meter: meter, cost: 0, controlMeter: controlMeter)
         fuelRegion = region
         controlStack.setCurrentFuelRegion(region, enclosing: enclosing)
     }
@@ -2724,8 +2751,39 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
     /// current again. Does nothing for a frame that shares its parent's meter.
     private mutating func closeFuelRegion(of frame: ControlStack.ControlFrame) {
         guard frame.fuelRegion != nil, let region = fuelRegion else { return }
-        iseqBuilder.patch(at: region.meter, .consumeFuel(Instruction.ConsumeFuelOperand(raw: region.cost)))
+        patchMeters(of: region)
         fuelRegion = frame.enclosingFuelRegion
+    }
+
+    /// Writes the final costs of `region` into its fuel meter and its current control checkpoint.
+    private mutating func patchMeters(of region: FuelRegion) {
+        if let meter = region.meter {
+            iseqBuilder.patch(at: meter, .consumeFuel(Instruction.ConsumeFuelOperand(raw: region.cost)))
+        }
+        if let controlMeter = region.controlMeter {
+            iseqBuilder.patch(
+                at: controlMeter, .controlCheckpoint(Instruction.ControlCheckpointOperand(raw: region.controlCost)))
+        }
+    }
+
+    /// Ends the current control segment and starts another at the insertion point once the
+    /// segment holds a polling interval of operators.
+    ///
+    /// Straight-line code has no region head to poll at, so without this a long function body
+    /// would run unchecked from entry to return. The checkpoint is emitted between two operators
+    /// and out of the rewinder's reach, like a region's meter, so no fusion and no accumulator
+    /// hand-off spans it.
+    private mutating func splitControlSegmentIfFull() {
+        guard let interval = controlCheckpointInterval, var region = fuelRegion, let controlMeter = region.controlMeter,
+            region.controlCost >= interval
+        else { return }
+        iseqBuilder.patch(
+            at: controlMeter, .controlCheckpoint(Instruction.ControlCheckpointOperand(raw: region.controlCost)))
+        region.controlMeter = iseqBuilder.insertingPC
+        region.controlCost = 0
+        emit(.controlCheckpoint(Instruction.ControlCheckpointOperand(raw: 0)))
+        iseqBuilder.resetLastEmission()
+        fuelRegion = region
     }
 
     /// Prices the operator about to be translated at one unit, in the region being translated.
@@ -2743,6 +2801,10 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
     private mutating func chargeFuelForOperator() {
         guard fuelRegion != nil, controlStack.isCurrentFrameReachable else { return }
         fuelRegion?.cost += 1
+        if controlCheckpointInterval != nil {
+            splitControlSegmentIfFull()
+            fuelRegion?.controlCost += 1
+        }
     }
 
     /// Gives back the unit charged by ``chargeFuelForOperator()`` for an operator that generates
@@ -2753,6 +2815,9 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
     private mutating func refundFuelForFreeOperator() {
         guard fuelRegion != nil, controlStack.isCurrentFrameReachable else { return }
         fuelRegion?.cost -= 1
+        if controlCheckpointInterval != nil {
+            fuelRegion?.controlCost -= 1
+        }
     }
 
     @discardableResult
@@ -3122,7 +3187,7 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
         // The function body's region closes here rather than in `visitEnd`, which returns for the
         // root frame without popping it.
         if let region = fuelRegion {
-            iseqBuilder.patch(at: region.meter, .consumeFuel(Instruction.ConsumeFuelOperand(raw: region.cost)))
+            patchMeters(of: region)
             fuelRegion = nil
         }
         let instructions = iseqBuilder.finalize()

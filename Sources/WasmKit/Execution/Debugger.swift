@@ -103,6 +103,11 @@
         ///   - store: Store that instantiates the module.
         ///   - imports: Imports required by `module` for instantiation.
         package init(module: Module, store: Store, imports: Imports) throws {
+            // A debuggable instance is translated without direct-only instructions, so a direct
+            // run loop would have no checkpoint to poll the controller at.
+            if store.executionControl != nil, store.engine.configuration.threadingModel == .direct {
+                throw ExecutionControlError.unsupportedThreadingModel
+            }
             let limit = store.engine.configuration.stackSize / MemoryLayout<StackSlot>.stride
             let instance = try module.instantiate(store: store, imports: imports, isDebuggable: true)
 

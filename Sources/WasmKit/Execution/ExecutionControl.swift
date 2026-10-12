@@ -12,6 +12,11 @@ public final class ExecutionControl: Sendable {
     /// This is an operation-count policy rather than a wall-clock bound. Export entry, completion,
     /// native import return, and caught guest exceptions also check the external signal.
     /// A translated superinstruction can perform several WebAssembly operations in one dispatch.
+    ///
+    /// A direct-threaded store counts WebAssembly operators instead of dispatches. Its checkpoints
+    /// sit at function entries, loop headers, `if` arms, and every interval of operators within a
+    /// longer region. Each one charges its segment in advance, so at most about twice the interval
+    /// runs between two polls.
     public let pollingInterval: UInt32
     /// Whether this controller records checkpoints for cross-thread progress diagnostics.
     private let recordsCheckpoints: Bool
@@ -105,6 +110,7 @@ public enum ExecutionControlError: Error, Equatable, Sendable {
     case invalidPollingInterval
     /// A controller cannot be used by more than one store, including replacement stores.
     case reusedControl
-    /// The requested engine does not use the supported token interpreter.
+    /// The debugger cannot run a direct-threaded store with a controller, whose debuggable code
+    /// has no checkpoints.
     case unsupportedThreadingModel
 }

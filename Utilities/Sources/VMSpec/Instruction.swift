@@ -1804,6 +1804,34 @@ extension VMGen {
         )
         outOfFuelTrap.isTrapPseudoInstruction = true
         instructions += [consumeFuel, outOfFuelTrap]
+        var controlCheckpoint = Instruction(
+            name: "controlCheckpoint",
+            documentation: """
+                Charge the execution-control budget of the segment that begins here
+
+                Emitted only for a direct-threaded store with an execution controller, at the
+                heads of the regions that fuel metering charges and every polling interval of
+                operators inside a long region. The immediate is the operator count of the
+                segment. An exhausted budget dispatches to `controlPoll` rather than calling, so
+                that the per-iteration charge of a loop stays a straight-line handler.
+                """,
+            immediateLayout: .controlCheckpoint
+        )
+        controlCheckpoint.mayDispatchToTrap = true
+        controlCheckpoint.isDirectThreadedOnly = true
+        var controlPoll = Instruction(
+            name: "controlPoll",
+            documentation: """
+                Check the store's execution controller and refill its budget. Dispatched to by
+                `controlCheckpoint`; never emitted.
+
+                Control-shaped so that it receives the program counter, which already points past
+                the head slot of the checkpoint's successor. A live store continues there.
+                """,
+            isControl: true, mayThrow: true
+        )
+        controlPoll.isTrapPseudoInstruction = true
+        instructions += [controlCheckpoint, controlPoll]
         // Typed function references
         instructions += [
             Instruction(name: "callRef", documentation: "WebAssembly Core Instruction `call_ref`",

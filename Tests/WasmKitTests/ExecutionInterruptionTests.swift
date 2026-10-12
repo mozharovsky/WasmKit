@@ -11,10 +11,12 @@ import WAT
 struct ExecutionInterruptionTests {
     /// Stops cycles formed by ordinary branches, tables, tail calls, and caught guest exceptions.
     ///
-    /// - Parameter shape: The control-flow form that must reach an interruption checkpoint.
+    /// - Parameters:
+    ///   - shape: The control-flow form that must reach an interruption checkpoint.
+    ///   - threadingModel: The dispatch model of the controlled store.
     /// - Throws: Fixture construction, export lookup, or controller configuration failures.
-    @Test(arguments: ["branch", "conditional", "table", "tail", "exception"])
-    func stopsEveryCycle(_ shape: String) throws {
+    @Test(arguments: ["branch", "conditional", "table", "tail", "exception"], ThreadingModels.all)
+    func stopsEveryCycle(_ shape: String, threadingModel: EngineConfiguration.ThreadingModel) throws {
         let bodies = [
             "branch": "(loop $again (br $again))",
             "conditional": "(loop $again (br_if $again (i32.const 1)))",
@@ -26,7 +28,7 @@ struct ExecutionInterruptionTests {
         do {
             try watchdog {
                 let control = try ExecutionControl(recordsCheckpoints: true)
-                let store = try controlledStore(control)
+                let store = try controlledStore(control, threadingModel: threadingModel)
                 let module = try parseWasm(
                     bytes: wat2wasm(
                         """
@@ -47,9 +49,10 @@ struct ExecutionInterruptionTests {
 
     /// Preserves finite straight-line results while inserting checkpoints in long functions.
     ///
+    /// - Parameter threadingModel: The dispatch model of the controlled store.
     /// - Throws: Fixture construction, configuration, or invocation failures.
-    @Test
-    func straightLineCodeHasCheckpoints() throws {
+    @Test(arguments: ThreadingModels.all)
+    func straightLineCodeHasCheckpoints(threadingModel: EngineConfiguration.ThreadingModel) throws {
         let work = Array(repeating: "global.get 0 i32.const 1 i32.add global.set 0", count: 5000).joined(separator: "\n")
         let module = try parseWasm(
             bytes: wat2wasm(
@@ -59,7 +62,7 @@ struct ExecutionInterruptionTests {
                 """))
         do {
             let control = try ExecutionControl(pollingInterval: 256, recordsCheckpoints: true)
-            let instance = try module.instantiate(store: controlledStore(control))
+            let instance = try module.instantiate(store: controlledStore(control, threadingModel: threadingModel))
             let function = try #require(instance.exports[function: "work"])
             #expect(try function() == [.i32(5000)])
             #expect(control.observedCheckpointCount > 20)
@@ -69,11 +72,11 @@ struct ExecutionInterruptionTests {
     /// Prevents a native import from swallowing stop and executing a later guest memory store.
     ///
     /// - Throws: Fixture, configuration, or export failures.
-    @Test
-    func nativeReentryCannotResumeStoppedGuest() throws {
+    @Test(arguments: ThreadingModels.all)
+    func nativeReentryCannotResumeStoppedGuest(threadingModel: EngineConfiguration.ThreadingModel) throws {
         do {
             let control = try ExecutionControl()
-            let store = try controlledStore(control)
+            let store = try controlledStore(control, threadingModel: threadingModel)
             var imports = Imports()
             imports.define(
                 module: "host", name: "catch",
@@ -106,11 +109,11 @@ struct ExecutionInterruptionTests {
     /// Preserves normal guest catches and rejects a stop raised inside their dynamic scope.
     ///
     /// - Throws: Fixture, configuration, or export failures.
-    @Test
-    func guestCatchCannotHideStop() throws {
+    @Test(arguments: ThreadingModels.all)
+    func guestCatchCannotHideStop(threadingModel: EngineConfiguration.ThreadingModel) throws {
         do {
             let control = try ExecutionControl()
-            let store = try controlledStore(control)
+            let store = try controlledStore(control, threadingModel: threadingModel)
             var imports = Imports()
             imports.define(
                 module: "host", name: "stop",
@@ -145,12 +148,13 @@ struct ExecutionInterruptionTests {
     ///
     /// - Parameters:
     ///   - path: How the host function is reached.
-    ///   - reason: The terminal reason that the host requests.
+    ///   - variant: The dispatch model of the store and the terminal reason that the host requests.
     /// - Throws: Fixture, configuration, or export failures.
-    @Test(arguments: RawImportPath.allCases, [ExecutionTermination.interrupted, .deadlineExceeded])
-    func aStopOutranksTheResultsOfARawImport(path: RawImportPath, reason: ExecutionTermination) throws {
+    @Test(arguments: RawImportPath.allCases, ThreadingModels.reasons)
+    func aStopOutranksTheResultsOfARawImport(path: RawImportPath, variant: ThreadingModels.Reason) throws {
+        let reason = variant.reason
         let control = try ExecutionControl()
-        let store = try controlledStore(control)
+        let store = try controlledStore(control, threadingModel: variant.threadingModel)
         let host: Function
         if path == .arrayImport {
             host = Function(store: store, parameters: [], results: [.v128]) { _, _ in
@@ -179,14 +183,13 @@ struct ExecutionInterruptionTests {
     ///
     /// - Parameters:
     ///   - threadingModel: The dispatch model of the store.
-    ///   - controlled: Whether the store has a controller, which is never signalled. Only token
-    ///     dispatch supports one.
+    ///   - controlled: Whether the store has a controller, which is never signalled.
     /// - Throws: Fixture, configuration, export, or invocation failures.
-    @Test(arguments: [(EngineConfiguration.ThreadingModel.token, true), (.token, false), (.direct, false)])
+    @Test(arguments: [(EngineConfiguration.ThreadingModel.token, true), (.token, false), (.direct, true), (.direct, false)])
     func aRawImportDeliversItsResults(threadingModel: EngineConfiguration.ThreadingModel, controlled: Bool) throws {
         let store =
             controlled
-            ? try controlledStore(ExecutionControl())
+            ? try controlledStore(ExecutionControl(), threadingModel: threadingModel)
             : Store(engine: Engine(configuration: EngineConfiguration(threadingModel: threadingModel, features: .all)))
         let value = V128(bytes: Array(1...16))
         let host = Function(
@@ -203,12 +206,12 @@ struct ExecutionInterruptionTests {
     /// Checks startup interruption before instantiation returns an instance to the host.
     ///
     /// - Throws: Fixture or configuration failures.
-    @Test
-    func moduleStartIsCovered() throws {
+    @Test(arguments: ThreadingModels.all)
+    func moduleStartIsCovered(threadingModel: EngineConfiguration.ThreadingModel) throws {
         do {
             try watchdog {
                 let control = try ExecutionControl(recordsCheckpoints: true)
-                let store = try controlledStore(control)
+                let store = try controlledStore(control, threadingModel: threadingModel)
                 let module = try parseWasm(bytes: wat2wasm("(module (func $start (loop $again (br $again))) (start $start))"))
                 try stopAfterProgress(control) {
                     #expect(throws: ExecutionTermination.interrupted) { try module.instantiate(store: store) }
@@ -224,8 +227,6 @@ struct ExecutionInterruptionTests {
     func controllerLifetime() throws {
         #expect(throws: ExecutionControlError.invalidPollingInterval) { try ExecutionControl(pollingInterval: 0) }
         let control = try ExecutionControl()
-        let direct = Engine(configuration: EngineConfiguration(threadingModel: .direct))
-        #expect(throws: ExecutionControlError.unsupportedThreadingModel) { try Store(engine: direct, executionControl: control) }
         let store = try controlledStore(control)
         #expect(throws: ExecutionControlError.reusedControl) { try controlledStore(control) }
         let instance = try parseWasm(bytes: wat2wasm("(module (func (export \"answer\") (result i32) i32.const 42))")).instantiate(store: store)
@@ -240,16 +241,20 @@ struct ExecutionInterruptionTests {
         #expect(throws: ExecutionTermination.deadlineExceeded) { try answer() }
     }
 
-    /// Constructs the serial token store with all parser features needed by the control-flow cases.
+    /// Constructs the serial store with all parser features needed by the control-flow cases.
     ///
-    /// - Parameter control: The unused signal bound to this store.
+    /// - Parameters:
+    ///   - control: The unused signal bound to this store.
+    ///   - threadingModel: The dispatch model. A direct store polls at translated checkpoints.
     /// - Returns: The store used for one fixture and its exported invocations.
-    /// - Throws: Unsupported configuration or reused controller failures.
-    private func controlledStore(_ control: ExecutionControl) throws -> Store {
+    /// - Throws: A reused controller.
+    private func controlledStore(
+        _ control: ExecutionControl, threadingModel: EngineConfiguration.ThreadingModel = .token
+    ) throws -> Store {
         try Store(
             engine: Engine(
                 configuration: EngineConfiguration(
-                    threadingModel: .token, compilationMode: .eager, features: .all
+                    threadingModel: threadingModel, compilationMode: .eager, features: .all
                 )), executionControl: control)
     }
 
@@ -326,6 +331,25 @@ struct ExecutionInterruptionTests {
         timer.resume()
         defer { timer.cancel() }
         try body()
+    }
+}
+
+/// The dispatch models that a controlled store supports, as test arguments.
+enum ThreadingModels {
+    /// Token dispatch, which polls between dispatch groups, and direct dispatch, which polls at
+    /// translated checkpoints.
+    static let all: [EngineConfiguration.ThreadingModel] = [.token, .direct]
+
+    /// A threading model paired with a terminal reason, so that one argument list covers both.
+    struct Reason: Sendable, CustomTestStringConvertible {
+        let threadingModel: EngineConfiguration.ThreadingModel
+        let reason: ExecutionTermination
+        var testDescription: String { "\(threadingModel) \(reason)" }
+    }
+
+    /// Every model with every reason.
+    static let reasons: [Reason] = all.flatMap { model in
+        [ExecutionTermination.interrupted, .deadlineExceeded].map { Reason(threadingModel: model, reason: $0) }
     }
 }
 
