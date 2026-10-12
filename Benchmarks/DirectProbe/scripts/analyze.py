@@ -21,6 +21,11 @@ COMPARISONS = [
     ("direct", "token-control", "potential: direct / token-control"),
 ]
 BOUNDS = [("direct-mprotect", "direct", "bounds: direct-mprotect / direct")]
+FUEL = [
+    ("token-fuel", "token-control", "token-fuel / token-control"),
+    ("direct-fuel", "direct", "direct-fuel / direct"),
+    ("direct-fuel", "token-control", "proxy: direct-fuel / token-control"),
+]
 
 
 def quantile(values, q):
@@ -227,6 +232,20 @@ def main():
             lines.append(
                 f"| {case} | {fmt_ns(v['direct']['median'])} | {fmt_ns(v['direct-mprotect']['median'])} | "
                 f"{ratio_cell(entry['ratios'][label]) if label in entry['ratios'] else ''} |")
+        lines.append("")
+
+    if os.path.isdir(os.path.join(out, "fuel")):
+        medians, bad = read_warm(os.path.join(out, "fuel"))
+        fuel = summarize_warm(medians, FUEL)
+        report["fuel"] = fuel
+        lines += ["## Fuel charges as a checkpoint proxy", "", f"Rejected samples: {bad}.", "",
+                  "| Case | token-control | direct | direct-fuel | " + " | ".join(l for _, _, l in FUEL) + " |",
+                  "| --- | ---: | ---: | ---: | --- | --- | --- |"]
+        for case, entry in sorted(fuel.items()):
+            v = entry["variants"]
+            cells = [fmt_ns(v[name]["median"]) if name in v else "" for name in ["token-control", "direct", "direct-fuel"]]
+            ratios = [ratio_cell(entry["ratios"][label]) if label in entry["ratios"] else "" for _, _, label in FUEL]
+            lines.append(f"| {case} | " + " | ".join(cells + ratios) + " |")
         lines.append("")
 
     if os.path.isdir(os.path.join(out, "cold")):

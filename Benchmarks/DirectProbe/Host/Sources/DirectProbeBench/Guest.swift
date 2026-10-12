@@ -9,14 +9,16 @@ import WasmKitWASI
 
 /// One engine configuration that the probe compares.
 ///
-/// Every variant translates lazily, uses the default stack, and runs without fuel. Only the
-/// dispatch model, the presence of an execution controller and, for the separately reported
-/// mprotect variant, the bounds strategy differ.
+/// Every main variant translates lazily, uses the default stack, and runs without fuel. Only the
+/// dispatch model and the presence of an execution controller differ. The mprotect variant and
+/// the fuel variants are reported separately. Fuel charges sit where a checkpoint of a
+/// controlled direct store would sit, so their cost estimates that design.
 struct Variant: Sendable, Hashable {
     let name: String
     let threadingModel: EngineConfiguration.ThreadingModel
     let memoryBoundsChecking: EngineConfiguration.MemoryBoundsChecking
     let controlled: Bool
+    var fuel = false
 
     static let token = Variant(name: "token", threadingModel: .token, memoryBoundsChecking: .software, controlled: false)
     static let tokenControl = Variant(
@@ -25,7 +27,12 @@ struct Variant: Sendable, Hashable {
     static let directMprotect = Variant(
         name: "direct-mprotect", threadingModel: .direct, memoryBoundsChecking: .mprotect, controlled: false)
 
-    static let all: [Variant] = [.token, .tokenControl, .direct, .directMprotect]
+    static let tokenFuel = Variant(
+        name: "token-fuel", threadingModel: .token, memoryBoundsChecking: .software, controlled: false, fuel: true)
+    static let directFuel = Variant(
+        name: "direct-fuel", threadingModel: .direct, memoryBoundsChecking: .software, controlled: false, fuel: true)
+
+    static let all: [Variant] = [.token, .tokenControl, .direct, .directMprotect, .tokenFuel, .directFuel]
 
     static func named(_ name: String) throws -> Variant {
         guard let variant = all.first(where: { $0.name == name }) else {
@@ -39,7 +46,8 @@ struct Variant: Sendable, Hashable {
             configuration: EngineConfiguration(
                 threadingModel: threadingModel,
                 compilationMode: compilationMode,
-                memoryBoundsChecking: memoryBoundsChecking
+                memoryBoundsChecking: memoryBoundsChecking,
+                fuelMetering: fuel
             ))
     }
 
@@ -128,6 +136,10 @@ final class GuestInstance {
         } else {
             control = nil
             store = Store(engine: engine)
+        }
+        if variant.fuel {
+            // Unlimited in practice. The charges are what the fuel variants measure.
+            store.fuel = Fuel(remaining: .max)
         }
         let state = HostState()
         let wasi = try WASIBridgeToHost(

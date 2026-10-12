@@ -172,6 +172,12 @@ def main():
                                 "--samples", str(args.samples), "--warmup", str(args.warmup)] + sizes,
                    timeout=3600, stdout_path=os.path.join(out, "bounds", "process-0.csv"))
 
+    if "fuel" in only:
+        runner.run("fuel-0", [args.bench, "warm", "--wasm", args.wasm, "--variants",
+                              "token-control,direct-fuel,direct,token-fuel", "--rounds", str(args.rounds),
+                              "--samples", str(args.samples), "--warmup", str(args.warmup)] + sizes,
+                   timeout=3600, stdout_path=os.path.join(out, "fuel", "process-0.csv"))
+
     if "cold" in only:
         for iteration in range(args.cold):
             shift = iteration % len(MAIN_VARIANTS)
