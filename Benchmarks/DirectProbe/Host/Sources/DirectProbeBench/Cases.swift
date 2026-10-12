@@ -210,7 +210,7 @@ struct LongActionCase: WarmCase {
             // A new instance translates the action with a unit that does not grow memory, so the
             // timed call pays for growth and imports rather than for translation.
             target = try GuestInstance(module: context.module, variant: guest.variant, engine: context.engine)
-            let warmup = [Value(signed: 10), Value(signed: seed &+ 1), Value(signed: Sizes.translatingUnit)]
+            let warmup = [Value(signed: Int32(10)), Value(signed: seed &+ 1), Value(signed: Sizes.translatingUnit)]
             _ = try target.call(target.function(.longAction), warmup)
         } else {
             target = guest

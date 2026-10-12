@@ -217,7 +217,7 @@ final class GuestInstance {
                     throw ProbeError("digest outside guest memory")
                 }
                 let hash = memory.withUnsafeBufferPointer(offset: offset, count: count) { raw in
-                    ProbeMath.fnv1a(UnsafeBufferPointer(raw.bindMemory(to: UInt8.self)))
+                    ProbeMath.fnv1a(raw.assumingMemoryBound(to: UInt8.self))
                 }
                 results[0] = .i32(hash)
             }))

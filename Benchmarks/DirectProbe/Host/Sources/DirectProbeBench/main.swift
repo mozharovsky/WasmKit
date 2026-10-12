@@ -241,7 +241,7 @@ func runVerify(_ options: Options, module: Module) throws -> Bool {
                 let host = NativeHost()
                 let expected = chatterWorkload(host, count: count, seed: 3)
                 guest.state.reset()
-                let results = try guest.call(guest.function(.chatter), [Value(signed: count), Value(signed: 3)])
+                let results = try guest.call(guest.function(.chatter), [Value(signed: count), Value(signed: Int32(3))])
                 let ok = results.first?.i64 == expected && guest.state.noteCount == host.noteCount
                     && guest.state.noteChecksum == host.noteChecksum
                     && guest.state.importCalls == UInt64(count) + host.noteCount
@@ -252,7 +252,7 @@ func runVerify(_ options: Options, module: Module) throws -> Bool {
                 let expected = longActionWorkload(host, rounds: rounds, seed: 5, unit: unit)
                 guest.state.reset()
                 let pagesBefore = guest.memoryPages
-                let results = try guest.call(guest.function(.longAction), [Value(signed: rounds), Value(signed: 5), Value(signed: unit)])
+                let results = try guest.call(guest.function(.longAction), [Value(signed: rounds), Value(signed: Int32(5)), Value(signed: unit)])
                 let ok = results.first?.i64 == expected && guest.state.noteCount == host.noteCount
                     && guest.state.noteChecksum == host.noteChecksum
                 check(ok, variant, "long_action(\(rounds), unit \(unit)) = \(results), expected \(expected)")
