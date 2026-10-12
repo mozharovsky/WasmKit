@@ -211,6 +211,7 @@ struct DirectExecutionControlTests {
                         (br_if $next (local.get $n)))
                     local.get $caught))
             """, features: .all)
+        /// Runs `grow`, `nested` and `catching` on `store` and returns their results in that order.
         func results(_ store: Store) throws -> [[Value]] {
             var imports = Imports()
             let inner = Box<Function?>(nil)
@@ -255,6 +256,7 @@ struct DirectExecutionControlTests {
                     (br_if $next (i32.lt_u (local.get $i) (local.get $n))))
                 local.get $i))
             """)
+        /// Counts to 1,000 on `store` with `budget` fuel and returns the outcome and the remaining fuel.
         func outcome(_ store: Store) throws -> (Result<[Value], Trap>, UInt64?) {
             store.fuel = Fuel(remaining: budget)
             let instance = try parseWasm(bytes: wasm).instantiate(store: store)
@@ -440,8 +442,9 @@ struct DirectExecutionControlTests {
                         (br_if $next (i32.lt_u (local.get $i) (local.get $n))))
                     \(tail)))
             """)
-        // The checks after the mark are the polls in the code that follows it, plus the fixed
-        // checks of the import's return and of the invocation's completion.
+        /// Runs `shape` on a fresh store and returns the checks after the mark. They are the polls in
+        /// the code that follows it, plus the fixed checks of the import's return and of the
+        /// invocation's completion.
         func checksAfterMark(_ pollingInterval: UInt32) throws -> UInt64 {
             let control = try ExecutionControl(pollingInterval: pollingInterval, recordsCheckpoints: true)
             let store = try directStore(control)
@@ -879,6 +882,8 @@ struct DirectExecutionControlTests {
         // 20,000 operators that fuel prices and the closing `end`, as in the straight-line check.
         let body = Array(repeating: "global.get 0 i32.const 1 i32.add global.set 0", count: 5_000).joined(separator: "\n")
         let straight = try wat2wasm("(module (global (mut i32) (i32.const 0)) (func (export \"work\") \(body)))")
+        /// Runs the straight-line function on a fresh store with the requested bounds and returns how
+        /// many times the controller was checked.
         func checks(_ pollingInterval: UInt32) throws -> UInt64 {
             let control = try ExecutionControl(pollingInterval: pollingInterval, recordsCheckpoints: true)
             let instance = try parseWasm(bytes: straight).instantiate(store: directStore(control, bounds: requested))
@@ -998,6 +1003,7 @@ struct DirectExecutionControlTests {
     /// A value handed to a closure that may cross threads, where the test orders every access.
     final class Box<Value>: @unchecked Sendable {
         var value: Value
+        /// Wraps the initial `value`.
         init(_ value: Value) { self.value = value }
     }
 
