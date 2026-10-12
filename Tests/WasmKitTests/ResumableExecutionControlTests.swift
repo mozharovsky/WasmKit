@@ -586,11 +586,13 @@ struct ResumableExecutionControlTests {
             store: store, control: control, run: try #require(instance.exports[function: "run"]), budgets: budgets)
     }
 
-    /// Keeps a pause's budget through refused completions and a foreign store, and continues in
-    /// checkpointed code from that budget when the right completion arrives.
+    /// Keeps a pause's budget through refused completions and a foreign store, continues in
+    /// checkpointed code from that budget when the right completion arrives, and leaves the
+    /// remaining budget to the next invocation after the call completes.
     ///
-    /// The expected budgets follow from the segments that ``budgeted`` describes. A token store
-    /// never reads or writes its budget, which stays at the interval throughout.
+    /// The expected budgets follow from the segments that ``budgeted`` describes. Only a poll refills
+    /// the budget, and none happens here. A token store never reads or writes its budget, which
+    /// stays at the interval throughout.
     ///
     /// - Parameter model: The dispatch model of both stores.
     /// - Throws: Fixture construction or invocation failures.
@@ -626,6 +628,12 @@ struct ResumableExecutionControlTests {
         #expect(main.store.controlBudget.value == (direct ? full - 9 : full))
         #expect(neighbour.store.controlBudget.value == neighbourBudget)
         #expect(main.control.termination == nil)
+
+        // The completed call's end does not refill the budget, so the next invocation starts from it.
+        let next = try ResumableCallTests.suspended(try main.run.invokeResumable())
+        #expect(main.budgets.values == (direct ? [full - 1, full - 2, full - 7, full - 10, full - 11] : Array(repeating: full, count: 5)))
+        #expect(main.store.controlBudget.value == (direct ? full - 11 : full))
+        next.cancel()
         neighbourPaused.cancel()
         #expect(neighbour.store.controlBudget.value == neighbourBudget)
     }
