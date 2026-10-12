@@ -37,6 +37,12 @@ struct Options {
     /// Run with fuel metering enabled and an effectively unlimited budget, to measure what
     /// metering costs rather than to bound anything.
     var fuelMetering: Bool = false
+    /// Run every case on a store with an execution controller that is never triggered, to measure
+    /// what polling costs. The controller uses its default polling interval.
+    var control: Bool = false
+    /// The warm-up and measurement windows of each case, in milliseconds.
+    var warmupMilliseconds: UInt64 = 1_000
+    var measureMilliseconds: UInt64 = 2_000
 
     /// `<repo>/Vendor/wasmi-benchmarks`, derived from this source file's location
     /// (`<repo>/Benchmarks/Sources/WasmiBenchmarks/`).
@@ -52,6 +58,7 @@ struct Options {
 
     static let usage = """
         usage: WasmiBenchmarks [filter] [--root <wasmi-benchmarks>] [--eager] [--token] [--software-bounds]
+                               [--control] [--warmup-ms <ms>] [--measure-ms <ms>]
 
           filter               Only run cases whose name contains this substring.
           --root <path>        wasmi-benchmarks checkout to replay.
@@ -60,6 +67,9 @@ struct Options {
           --token              Use token-threaded dispatch instead of direct threading.
           --software-bounds    Use software memory bounds checking.
           --fuel               Enable fuel metering with an unlimited budget.
+          --control            Run on stores with an execution controller (token only).
+          --warmup-ms <ms>     Warm-up window of each case. (default: 1000)
+          --measure-ms <ms>    Measurement window of each case. (default: 2000)
         """
 
     static func parse(_ arguments: [String]) throws -> Options {
@@ -76,6 +86,16 @@ struct Options {
             case "--token": options.threadingModel = .token
             case "--software-bounds": options.memoryBoundsChecking = .software
             case "--fuel": options.fuelMetering = true
+            case "--control": options.control = true
+            case "--warmup-ms", "--measure-ms":
+                guard let value = arguments.next().flatMap({ UInt64($0) }) else {
+                    throw CommandError("\(argument) requires a number of milliseconds")
+                }
+                if argument == "--warmup-ms" {
+                    options.warmupMilliseconds = value
+                } else {
+                    options.measureMilliseconds = value
+                }
             case "-h", "--help":
                 print(usage)
                 exit(EXIT_SUCCESS)
@@ -152,6 +172,12 @@ final class Runner {
     }
 
     func run() throws {
+        // The engine may replace a requested setting, so report what it actually chose.
+        let configuration = try makeStore().engine.configuration
+        FileHandle.standardError.write(
+            Data(
+                ("# engine threading=\(configuration.threadingModel) bounds=\(configuration.memoryBoundsChecking)"
+                    + " compilation=\(configuration.compilationMode) control=\(options.control)\n").utf8))
         if shouldRun("coremark") {
             try runCoreMark()
         }
@@ -226,7 +252,7 @@ final class Runner {
 
     // MARK: Engine and module loading
 
-    private func makeStore() -> Store {
+    private func makeStore() throws -> Store {
         let engine = Engine(
             configuration: EngineConfiguration(
                 threadingModel: options.threadingModel,
@@ -236,7 +262,10 @@ final class Runner {
                 memoryBoundsChecking: options.memoryBoundsChecking,
                 fuelMetering: options.fuelMetering
             ))
-        let store = Store(engine: engine)
+        let store =
+            options.control
+            ? try Store(engine: engine, executionControl: ExecutionControl())
+            : Store(engine: engine)
         if options.fuelMetering {
             // Unlimited in practice: the point is to pay for the checkpoints, not to run out.
             store.fuel = Fuel(remaining: .max)
@@ -264,14 +293,14 @@ final class Runner {
     // MARK: Cases
 
     private func run(_ watCase: WatCase) throws {
-        let store = makeStore()
+        let store = try makeStore()
         let instance = try loadWat(watCase.name).instantiate(store: store)
         let run = instance.exports[function: "run"]!
         try measure(watCase.name) { _ = try run([watCase.input]) }
     }
 
     private func run(_ rustCase: RustCase) throws {
-        let store = makeStore()
+        let store = try makeStore()
         let instance = try loadWasm("res/rust/cases/\(rustCase.name)/out.wasm").instantiate(store: store)
         let setup = instance.exports[function: "setup"]!
 
@@ -296,7 +325,7 @@ final class Runner {
 
     /// CoreMark reports its own score, so it is run exactly once instead of being timed.
     private func runCoreMark() throws {
-        let store = makeStore()
+        let store = try makeStore()
         let module = try loadWasm("res/wasm/coremark.wasm")
         let start = Self.now()
         let clockMs = Function(store: store, parameters: [], results: [.i32]) { _, _ in
@@ -315,8 +344,8 @@ final class Runner {
     /// Criterion-like: warm up for ~1 s, then measure for ~2 s and at least 10
     /// iterations. Reports the mean and the minimum wall time of one `run`.
     private func measure(_ name: String, _ body: () throws -> Void) rethrows {
-        let warmupNanoseconds: UInt64 = 1_000_000_000
-        let measureNanoseconds: UInt64 = 2_000_000_000
+        let warmupNanoseconds = options.warmupMilliseconds * 1_000_000
+        let measureNanoseconds = options.measureMilliseconds * 1_000_000
         let minimumIterations = 10
 
         var start = Self.now()
