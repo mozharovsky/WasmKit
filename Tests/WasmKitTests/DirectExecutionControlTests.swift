@@ -591,6 +591,222 @@ struct DirectExecutionControlTests {
         try fixture("\(repeated("nop", 100_000)) (global.set $count (i32.const 1))")
     }
 
+    // MARK: - The largest gap between two polls
+
+    /// Ten increments of a global or 40 `nop`s, either way 40 operators that the polling interval
+    /// counts.
+    private static func tail(_ kind: String) -> String {
+        kind == "nops"
+            ? repeated("nop", 40)
+            : repeated("global.get $g i32.const 1 i32.add global.set $g", 10)
+    }
+
+    /// The operators of either ``tail(_:)``.
+    private static let tailOperators: UInt64 = 40
+
+    /// Loops whose body branches past a call to the end label of the frame that holds it.
+    ///
+    /// The call is never made. Its after-call checkpoint lies inside the frame, so only a
+    /// checkpoint at the end label charges the code that follows. `sample` records the
+    /// controller's count at the head of each iteration.
+    private static func skipModule(_ kind: String) throws -> [UInt8] {
+        try wat2wasm(
+            """
+            (module (import "host" "sample" (func $sample)) (import "host" "never" (func $never))
+                (global $g (mut i32) (i32.const 0)) (tag $e)
+                (func $thrower (throw $e))
+                (func (export "block") (param $n i32) (param $skip i32) (local $i i32)
+                    (loop $next
+                        (call $sample)
+                        (block $b
+                            (br_if $b (local.get $skip))
+                            (call $never))
+                        \(tail(kind))
+                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                        (br_if $next (i32.lt_u (local.get $i) (local.get $n)))))
+                (func (export "table") (param $n i32) (param $skip i32) (local $i i32)
+                    (loop $next
+                        (call $sample)
+                        (block $b
+                            (block $c
+                                (br_table $b $c (i32.sub (local.get $skip) (i32.const 1))))
+                            (call $never))
+                        \(tail(kind))
+                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                        (br_if $next (i32.lt_u (local.get $i) (local.get $n)))))
+                (func (export "catch") (param $n i32) (param $skip i32) (local $i i32)
+                    (loop $next
+                        (call $sample)
+                        (block $landed
+                            (try_table (catch_all $landed)
+                                (call $thrower)))
+                        \(tail(kind))
+                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                        (br_if $next (i32.lt_u (local.get $i) (local.get $n))))))
+            """, features: .all)
+    }
+
+    /// The controller's count at the head of every iteration of `shape`.
+    private func samples(_ wasm: [UInt8], _ shape: String, iterations: Int, pollingInterval: UInt32) throws -> [UInt64] {
+        let control = try ExecutionControl(pollingInterval: pollingInterval, recordsCheckpoints: true)
+        let store = try directStore(control)
+        let samples = Box<[UInt64]>([])
+        var imports = Imports()
+        imports.define(
+            module: "host", name: "sample",
+            Function(store: store, parameters: []) { _, _ in
+                samples.value.append(control.observedCheckpointCount)
+                return []
+            })
+        imports.define(
+            module: "host", name: "never",
+            Function(store: store, parameters: []) { _, _ in
+                Issue.record("The skipped call ran")
+                return []
+            })
+        let instance = try parseWasm(bytes: wasm, features: .all).instantiate(store: store, imports: imports)
+        let function = try #require(instance.exports[function: shape])
+        _ = try function([.i32(UInt32(iterations)), .i32(1)])
+        #expect(samples.value.count == iterations)
+        return samples.value
+    }
+
+    /// Bounds the largest gap between two polls from below and checks it against the interval.
+    ///
+    /// Each iteration runs at least the 40 operators of its tail. A run of `m` iterations with no
+    /// poll between their heads lies inside one gap, so that gap holds at least `40 m` operators.
+    /// The checks that are not polls, such as import returns and caught exceptions, come from a run
+    /// whose interval is never reached.
+    ///
+    /// The branch skips the call and with it the call's after-call checkpoint. Without a
+    /// checkpoint at the end label, every iteration would run its tail uncharged, and the gap would
+    /// grow with the iterations rather than stay within one segment.
+    ///
+    /// - Parameters:
+    ///   - shape: How the body reaches the end label past the call.
+    ///   - tail: `arithmetic` or `nops`, the operators that follow the end label.
+    ///   - pollingInterval: The operators allowed between two polls.
+    /// - Throws: Fixture construction or invocation failures.
+    @Test(arguments: ["block", "table", "catch"], [("arithmetic", UInt32(64)), ("arithmetic", 1024), ("nops", 64), ("nops", 1024)])
+    func theLargestGapStaysWithinTheInterval(shape: String, configuration: (tail: String, pollingInterval: UInt32)) throws {
+        let wasm = try Self.skipModule(configuration.tail)
+        let iterations = 4_000
+        let measured = try samples(wasm, shape, iterations: iterations, pollingInterval: configuration.pollingInterval)
+        let baseline = try samples(wasm, shape, iterations: iterations, pollingInterval: .max)
+        var longest = 0
+        var run = 0
+        for index in 1..<iterations {
+            let made = (measured[index] - measured[index - 1]) - (baseline[index] - baseline[index - 1])
+            run = made == 0 ? run + 1 : 0
+            longest = max(longest, run)
+        }
+        let gapAtLeast = UInt64(longest) * Self.tailOperators
+        #expect(gapAtLeast <= UInt64(configuration.pollingInterval), "a gap of at least \(gapAtLeast) operators")
+    }
+
+    // MARK: - Code after a merge label, after a poll
+
+    /// Recursions whose frames run a tail after a merge label once their callee returns.
+    ///
+    /// The deepest frame calls `mark`. Every frame then reaches its tail through one kind of
+    /// merge: the end of an `if`, a `br` or `br_table` to a block's end, a caught exception, or
+    /// the end of a loop.
+    private static func mergeModule(_ kind: String) throws -> [UInt8] {
+        try wat2wasm(
+            """
+            (module (import "host" "mark" (func $mark)) (global $g (mut i32) (i32.const 0)) (tag $e)
+                (func $if (export "if") (param $n i32)
+                    (if (local.get $n)
+                        (then (call $if (i32.sub (local.get $n) (i32.const 1))))
+                        (else (call $mark)))
+                    \(tail(kind)))
+                (func $block (export "block") (param $n i32)
+                    (block $out
+                        (block $base
+                            (br_if $base (i32.eqz (local.get $n)))
+                            (call $block (i32.sub (local.get $n) (i32.const 1)))
+                            (br $out))
+                        (call $mark))
+                    \(tail(kind)))
+                (func $table (export "table") (param $n i32)
+                    (block $out
+                        (block $base
+                            (br_if $base (i32.eqz (local.get $n)))
+                            (call $table (i32.sub (local.get $n) (i32.const 1)))
+                            (br_table $out $out (local.get $n)))
+                        (call $mark))
+                    \(tail(kind)))
+                (func $catch (export "catch") (param $n i32)
+                    (block $landed
+                        (try_table (catch_all $landed)
+                            (block $base
+                                (br_if $base (i32.eqz (local.get $n)))
+                                (call $catch (i32.sub (local.get $n) (i32.const 1)))
+                                (throw $e))
+                            (call $mark)
+                            (throw $e)))
+                    \(tail(kind)))
+                (func $loop (export "loop") (param $n i32)
+                    (if (i32.eqz (local.get $n)) (then (call $mark) (return)))
+                    (loop $body
+                        (call $loop (i32.sub (local.get $n) (i32.const 1))))
+                    \(tail(kind))))
+            """, features: .all)
+    }
+
+    /// The recursion depth of the merge fixtures.
+    private static let depth = 40
+
+    /// Runs `shape` and returns the checks counted after `mark` and the store's budget there.
+    private func afterMark(_ wasm: [UInt8], _ shape: String, pollingInterval: UInt32) throws -> (checks: UInt64, budget: UInt64) {
+        let control = try ExecutionControl(pollingInterval: pollingInterval, recordsCheckpoints: true)
+        let store = try directStore(control)
+        let marks = Box(0)
+        let checks = Box<UInt64>(0)
+        let budget = Box<UInt64>(0)
+        var imports = Imports()
+        imports.define(
+            module: "host", name: "mark",
+            Function(store: store, parameters: []) { caller, _ in
+                marks.value += 1
+                checks.value = control.observedCheckpointCount
+                budget.value = caller.store.controlBudget.value
+                return []
+            })
+        let instance = try parseWasm(bytes: wasm, features: .all).instantiate(store: store, imports: imports)
+        let function = try #require(instance.exports[function: shape])
+        _ = try function([.i32(UInt32(Self.depth))])
+        #expect(marks.value == 1)
+        return (control.observedCheckpointCount - checks.value, budget.value)
+    }
+
+    /// Charges the code after a merge label after the polls that precede it.
+    ///
+    /// Every operator after `mark` has to be charged after it. With `b` left in the budget at
+    /// the mark and `k` polls after it, at most `b + k * interval` operators can be charged, so
+    /// `R` operators after the mark need `k >= ceil((R - b) / interval)`. The fixtures run at
+    /// least `depth * 40` operators after the mark. The `mark` import sits in the deepest frame, so
+    /// its own after-call checkpoint lies on none of the merge labels under test.
+    ///
+    /// - Parameters:
+    ///   - shape: The kind of merge.
+    ///   - tail: `arithmetic` or `nops`, the operators that follow the merge label.
+    ///   - pollingInterval: The operators allowed between two polls.
+    /// - Throws: Fixture construction or invocation failures.
+    @Test(
+        arguments: ["if", "block", "table", "catch", "loop"],
+        [("arithmetic", UInt32(16)), ("arithmetic", 64), ("nops", 16), ("nops", 64)])
+    func codeAfterAMergeLabelIsChargedAfterIt(shape: String, configuration: (tail: String, pollingInterval: UInt32)) throws {
+        let wasm = try Self.mergeModule(configuration.tail)
+        let measured = try afterMark(wasm, shape, pollingInterval: configuration.pollingInterval)
+        let baseline = try afterMark(wasm, shape, pollingInterval: .max)
+        let polls = measured.checks - baseline.checks
+        let interval = UInt64(configuration.pollingInterval)
+        let after = UInt64(Self.depth) * Self.tailOperators
+        let required = after > measured.budget ? (after - measured.budget + interval - 1) / interval : 0
+        #expect(polls >= required, "\(polls) polls for \(after) operators after a budget of \(measured.budget)")
+    }
+
     #if WasmDebuggingSupport
         /// A module whose start function calls the `host.started` import, with an `answer` export.
         private static let startModule = Result {
