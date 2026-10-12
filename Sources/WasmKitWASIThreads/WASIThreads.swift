@@ -38,6 +38,9 @@ public enum WASIThreadsError: Error, Sendable, CustomStringConvertible {
     case nativeStackSizeTooSmall(minimum: Int)
     case unsupportedPlatform
     case incompatibleEngine(String)
+    /// The store has an execution controller. Each worker runs in a store of its own, which a stop
+    /// of the spawning store would not reach, so such a store gets no `thread-spawn` import.
+    case controlledStore
 
     public var description: String {
         switch self {
@@ -45,6 +48,7 @@ public enum WASIThreadsError: Error, Sendable, CustomStringConvertible {
         case .nativeStackSizeTooSmall(let minimum): "WASI Threads native stack size must be at least \(minimum) bytes"
         case .unsupportedPlatform: "WASI Threads requires a 64-bit macOS or Linux host"
         case .incompatibleEngine(let reason): "WASI Threads requires \(reason)"
+        case .controlledStore: "WASI Threads cannot spawn workers for a store with an execution controller"
         }
     }
 }
@@ -177,8 +181,18 @@ public final class WASIThreads: @unchecked Sendable {
 
     /// Creates the imports for one store, including the module's shared memory
     /// import and `wasi.thread-spawn`.
+    ///
+    /// A store with an execution controller is refused before the child imports are built. The
+    /// `thread-spawn` import exists only through this method and is bound to `store`, so a refused
+    /// store cannot start a worker.
+    ///
+    /// - Parameter store: The store that instantiates the module.
+    /// - Returns: The child imports with the shared memory and `wasi.thread-spawn` defined.
+    /// - Throws: ``WASIThreadsError/controlledStore`` for a store with an execution controller, the
+    ///   failures of the child imports builder, or ``WASIThreadsError/unsupportedPlatform``.
     public func makeImports(store: Store) throws -> Imports {
         #if os(macOS) || os(Linux)
+            guard !store.hasExecutionControl else { throw WASIThreadsError.controlledStore }
             var imports = try childImports(store)
             imports.define(
                 module: sharedMemoryImport.module, name: sharedMemoryImport.name,

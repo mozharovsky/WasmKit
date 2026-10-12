@@ -97,6 +97,12 @@ public final class Store {
     /// The optional external stop signal fixed for this store's entire lifetime.
     let executionControl: ExecutionControl?
 
+    /// Whether an execution controller is bound to this store.
+    ///
+    /// Package modules read it to refuse work that would run guest code in another store, which a
+    /// stop of this one would not reach.
+    package var hasExecutionControl: Bool { executionControl != nil }
+
     /// The operators a direct-threaded controlled store may still run before it reads its
     /// controller again.
     ///
