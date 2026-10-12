@@ -70,6 +70,10 @@ jobs:
             echo "::error::ThreadSanitizer reported a race"
             exit 1
           fi
+          # A quiet log only counts when the tests ran with the ThreadSanitizer runtime.
+          bundle="$(find .build -path '*WasmKitPackageTests.xctest/Contents/MacOS/WasmKitPackageTests' -type f | head -1)"
+          echo "test binary: $bundle"
+          otool -L "$bundle" | grep tsan || { echo "::error::the tests did not link ThreadSanitizer"; exit 1; }
           exit "$status"
 
   docc:
