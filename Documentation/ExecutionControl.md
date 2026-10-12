@@ -14,6 +14,13 @@ import return, caught guest exceptions, and debugger entry, resume, and steps al
 controller.
 A stop takes precedence over host results, host errors, and result validation.
 
+Resumable invocations check the controller at entry, when a host call returns, throws, or asks to
+pause, and before their results return. A stop outranks a host function's request to pause. A
+resume checks the controller before it judges the completion, so a stop also outranks a stale,
+foreign, or mistyped answer. A resumed invocation continues in the polling loop. The controller
+does not release a paused invocation. Its owner resumes or cancels the continuation, and a resume
+after a stop throws the stop's reason.
+
 The host owns timers and requests `deadlineExceeded` when its deadline expires. Parsing,
 translation, native imports, and blocking atomic waits must return before interruption can unwind
 them. The controller does not preempt native code or coordinate separate stores. WASI thread
