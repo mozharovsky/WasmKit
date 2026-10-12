@@ -1,0 +1,10 @@
+Sources/WasmKit/Component/CanonicalLifting.swift:10:11: warning: Parameter 'memoryBase' not found in type method declaration (in target 'WasmKit' from project 'WasmKit')
+Sources/WasmKit/Component/CanonicalLifting.swift:10:11: warning: Parameter 'memoryBase' not found in type method declaration. Remove 'memoryBase' parameter documentation.
+Sources/WasmKit/Component/CanonicalLifting.swift:10:99: warning: Parameter 'context' is missing documentation (in target 'WasmKit' from project 'WasmKit')
+Sources/WasmKit/Component/CanonicalLifting.swift:10:99: warning: Parameter 'context' is missing documentation. Document 'context' parameter.
+Sources/WasmKit/Docs.docc/Docs.md:101:5: warning: 'parseWasm(bytes:features:)' is ambiguous at '/WasmKit' (in target 'WasmKit' from project 'WasmKit')
+Sources/WasmKit/Docs.docc/Docs.md:101:5: warning: 'parseWasm(bytes:features:)' is ambiguous at '/WasmKit' Insert '-(ArraySlice<UInt8>,_)' for 
+Sources/WasmKit/Engine.swift:196:68: warning: Parameter 'memoryBoundsChecking' is missing documentation (in target 'WasmKit' from project 'WasmKit')
+Sources/WasmKit/Engine.swift:196:68: warning: Parameter 'memoryBoundsChecking' is missing documentation. Document 'memoryBoundsChecking' parameter.
+Sources/WasmKit/Module.swift:53:25: warning: 'parseWasm(bytes:features:)' is ambiguous at '/WasmKit' (in target 'WasmKit' from project 'WasmKit')
+Sources/WasmKit/Module.swift:53:25: warning: 'parseWasm(bytes:features:)' is ambiguous at '/WasmKit' Insert '-(ArraySlice<UInt8>,_)' for 

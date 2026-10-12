@@ -1,8 +1,8 @@
 #!/bin/bash
 # Builds the WasmKit documentation of the checked-out variant and lists its warnings.
 #
-# Usage: docc.sh NAME. The head and core variants fail on a warning in a file that the resumable
-# change touches, so the job compares warnings across variants without hiding older ones.
+# Usage: docc.sh NAME. The head and core variants fail on any warning that upstream 0.4.2 does not
+# have. The list of upstream warnings comes from the upstream variant of this job.
 set -uo pipefail
 
 name="$1"
@@ -22,9 +22,13 @@ cat "$warnings"
 
 case "$name" in
 head | core)
-    if grep -E 'ResumableCall\.swift|Execution/Execution\.swift|Execution/Function\.swift|Execution/Store\.swift|Docs\.docc' "$warnings"; then
-        echo "::error::warnings in files of the resumable change"
+    # Upstream 0.4.2 already has these warnings. Any other warning is new.
+    added="$(LC_ALL=C comm -13 <(LC_ALL=C sort -u "$(dirname "$0")/docc-upstream-warnings.txt") <(LC_ALL=C sort -u "$warnings"))"
+    if [ -n "$added" ]; then
+        echo "$added"
+        echo "::error::warnings that upstream 0.4.2 does not have"
         exit 1
     fi
+    echo "$name has only the upstream warnings"
     ;;
 esac
