@@ -16,7 +16,10 @@ traits="FileSystem,MultiThread,ComponentModel,WasmDebuggingSupport,Disassembler"
 log="$RUNNER_TEMP/$name.log"
 
 git config --global --add safe.directory "$GITHUB_WORKSPACE"
-echo "head $(git rev-parse HEAD^) checks $(git rev-parse HEAD)"
+# The checks commits add only CI files, so the sources under test must be those of the PR head.
+head="$(git rev-parse origin/resumable-host-calls-0-4-2)"
+git diff --quiet "$head" HEAD -- Sources Tests || { echo "::error::the sources differ from the PR head"; exit 1; }
+echo "head $head checks $(git rev-parse HEAD)"
 if [ "$name" != baseline ]; then
     git apply "$here/mutants/$name.patch" || { echo "::error::$name does not apply"; exit 1; }
 fi

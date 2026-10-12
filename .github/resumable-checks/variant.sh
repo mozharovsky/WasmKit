@@ -2,7 +2,7 @@
 # Checks out one source variant in detached state.
 #
 # Usage: variant.sh NAME, where NAME is head, base, upstream, or core.
-#   head      The pull request head, the parent of the checks commit.
+#   head      The tip of the pull request branch.
 #   base      release/0.4.2 with execution control.
 #   upstream  WasmKit 0.4.2.
 #   core      The resumable core on upstream 0.4.2 with its documentation fix, without control.
@@ -16,7 +16,7 @@ cp "$here/core-docs.patch" "$scratch/"
 git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
 case "$name" in
-head) git checkout --quiet --detach HEAD^ ;;
+head) git checkout --quiet --detach origin/resumable-host-calls-0-4-2 ;;
 base) git checkout --quiet --detach ac035e8b28b9c3d73afe5e93cd4d623b6e12382a ;;
 upstream) git checkout --quiet --detach a7455cb8474b96b2c58f0adc1f70d0270b8010bf ;;
 core)
