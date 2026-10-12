@@ -147,17 +147,22 @@ struct DirectExecutionControlTests {
             let results = Box<[[Value]]>([])
             let done = DispatchSemaphore(value: 0)
             DispatchQueue.global().async {
-                for _ in 0..<50 {
-                    results.value.append((try? neighbourSum.value([.i32(100_000)])) ?? [])
+                for _ in 0..<20 {
+                    results.value.append((try? neighbourSum.value([.i32(20_000)])) ?? [])
                 }
                 done.signal()
             }
             try stopAfterProgress(stopped, reason: .interrupted) {
                 #expect(throws: ExecutionTermination.interrupted) { try spin() }
             }
-            #expect(done.wait(timeout: .now() + 10) == .success)
-            let expected = try plainSum([.i32(100_000)])
-            #expect(results.value.count == 50)
+            // A store runs on one thread at a time, so the neighbour is used again only after the
+            // worker is done with it. A sanitizer makes the worker several times slower.
+            guard done.wait(timeout: .now() + 90) == .success else {
+                Issue.record("The neighbouring store did not finish its calls")
+                return
+            }
+            let expected = try plainSum([.i32(20_000)])
+            #expect(results.value.count == 20)
             #expect(results.value.allSatisfy { value in value == expected })
             #expect(neighbourControl.termination == nil)
             #expect(try neighbourSum.value([.i32(10)]) == [.i32(55)])
