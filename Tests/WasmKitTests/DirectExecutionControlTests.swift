@@ -807,6 +807,88 @@ struct DirectExecutionControlTests {
         #expect(polls >= required, "\(polls) polls for \(after) operators after a budget of \(measured.budget)")
     }
 
+    // MARK: - Memory bounds
+
+    /// Runs the controller's main contract under each bounds strategy a direct engine accepts.
+    ///
+    /// An out-of-bounds trap, which mprotect raises through a signal, leaves the store live.
+    /// Memory growth keeps the results of an uncontrolled store with the same strategy. A spin
+    /// stops, the stop retires the store, and straight-line code polls exactly as often as it does
+    /// with software bounds.
+    ///
+    /// - Parameter bounds: `software`, `mprotect`, or `default`. An engine that cannot back
+    ///   mprotect bounds falls back to software, which the run prints.
+    /// - Throws: Fixture construction or invocation failures.
+    @Test(arguments: ["software", "mprotect", "default"])
+    func controlWorksUnderEachBoundsStrategy(bounds: String) throws {
+        let wasm = try wat2wasm(
+            """
+            (module (memory 1 64) (global $count (export "count") (mut i32) (i32.const 0))
+                (func (export "oob") (result i32) (i32.load (i32.const 70000)))
+                (func (export "grow") (param $pages i32) (result i32) (local $i i32) (local $acc i32)
+                    (loop $next
+                        (drop (memory.grow (i32.const 1)))
+                        (i32.store (i32.mul (memory.size) (i32.const 65532)) (local.get $i))
+                        (local.set $acc (i32.add (local.get $acc)
+                            (i32.load (i32.mul (memory.size) (i32.const 65532)))))
+                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                        (br_if $next (i32.lt_u (local.get $i) (local.get $pages))))
+                    (i32.add (local.get $acc) (memory.size)))
+                (func (export "spin")
+                    (loop $again (global.set $count (i32.add (global.get $count) (i32.const 1))) (br $again)))
+                (func (export "answer") (result i32) i32.const 42))
+            """)
+        let requested: EngineConfiguration.MemoryBoundsChecking? =
+            switch bounds {
+            case "software": .software
+            case "mprotect": .mprotect
+            default: nil
+            }
+        let control = try ExecutionControl(pollingInterval: 64, recordsCheckpoints: true)
+        let store = try directStore(control, bounds: requested)
+        print("Direct control with \(bounds) bounds runs \(store.engine.configuration.memoryBoundsChecking) bounds")
+        let instance = try parseWasm(bytes: wasm).instantiate(store: store)
+        let oob = try #require(instance.exports[function: "oob"])
+        let grow = try #require(instance.exports[function: "grow"])
+        let spin = try #require(instance.exports[function: "spin"])
+        let answer = try #require(instance.exports[function: "answer"])
+        do {
+            _ = try oob()
+            Issue.record("The out-of-bounds load returned")
+        } catch let trap as Trap {
+            #expect(trap.reason.description == TrapReason.memoryOutOfBounds.description)
+        }
+        #expect(control.termination == nil)
+        #expect(try answer() == [.i32(42)])
+
+        let plain = try parseWasm(bytes: wasm).instantiate(
+            store: Store(
+                engine: Engine(
+                    configuration: EngineConfiguration(threadingModel: .direct, memoryBoundsChecking: requested))))
+        let plainGrow = try #require(plain.exports[function: "grow"])
+        #expect(try grow([.i32(30)]) == plainGrow([.i32(30)]))
+
+        try watchdog {
+            try stopAfterProgress(control, reason: .interrupted) {
+                #expect(throws: ExecutionTermination.interrupted) { try spin() }
+            }
+        }
+        #expect(throws: ExecutionTermination.interrupted) { try answer() }
+        #expect(throws: ExecutionTermination.interrupted) { try oob() }
+
+        // 20,000 operators that fuel prices and the closing `end`, as in the straight-line check.
+        let body = Array(repeating: "global.get 0 i32.const 1 i32.add global.set 0", count: 5_000).joined(separator: "\n")
+        let straight = try wat2wasm("(module (global (mut i32) (i32.const 0)) (func (export \"work\") \(body)))")
+        func checks(_ pollingInterval: UInt32) throws -> UInt64 {
+            let control = try ExecutionControl(pollingInterval: pollingInterval, recordsCheckpoints: true)
+            let instance = try parseWasm(bytes: straight).instantiate(store: directStore(control, bounds: requested))
+            let work = try #require(instance.exports[function: "work"])
+            _ = try work()
+            return control.observedCheckpointCount
+        }
+        #expect(try checks(16) - checks(.max) == (20_001 + 15) / 16 - 1)
+    }
+
     #if WasmDebuggingSupport
         /// A module whose start function calls the `host.started` import, with an `answer` export.
         private static let startModule = Result {
@@ -939,17 +1021,21 @@ struct DirectExecutionControlTests {
                 """))
     }
 
-    /// Constructs a direct-threaded store with software bounds and all parser features.
+    /// Constructs a direct-threaded store with eager compilation and all parser features.
     ///
-    /// - Parameter control: The unclaimed signal bound to this store.
+    /// - Parameters:
+    ///   - control: The unclaimed signal bound to this store.
+    ///   - bounds: The memory bounds strategy, nil for the platform default.
     /// - Returns: The store used for one fixture.
     /// - Throws: A reused controller.
-    private func directStore(_ control: ExecutionControl) throws -> Store {
+    private func directStore(
+        _ control: ExecutionControl, bounds: EngineConfiguration.MemoryBoundsChecking? = .software
+    ) throws -> Store {
         try Store(
             engine: Engine(
                 configuration: EngineConfiguration(
                     threadingModel: .direct, compilationMode: .eager, features: .all,
-                    memoryBoundsChecking: .software
+                    memoryBoundsChecking: bounds
                 )), executionControl: control)
     }
 
