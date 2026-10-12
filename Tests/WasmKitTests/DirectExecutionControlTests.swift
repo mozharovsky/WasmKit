@@ -19,22 +19,12 @@ struct DirectExecutionControlTests {
     /// - Throws: Fixture construction, export lookup, or controller configuration failures.
     @Test(arguments: ["loop", "straight"], [ExecutionTermination.interrupted, .deadlineExceeded])
     func aStopEndsGuestCode(shape: String, reason: ExecutionTermination) throws {
+        // Built before the watchdog starts, because a sanitizer makes the long module slow to build.
+        let module = try shape == "loop" ? Self.loopModule.get() : Self.straightLineModule.get()
         try watchdog {
             let control = try ExecutionControl(pollingInterval: 64, recordsCheckpoints: true)
             let store = try directStore(control)
-            let body =
-                shape == "loop"
-                ? "(loop $again global.get 0 i32.const 1 i32.add global.set 0 (br $again))"
-                : Array(repeating: "global.get 0 i32.const 1 i32.add global.set 0", count: Self.straightLineCount)
-                    .joined(separator: "\n")
-            let instance = try parseWasm(
-                bytes: wat2wasm(
-                    """
-                    (module (global $count (export "count") (mut i32) (i32.const 0))
-                        (func (export "work") \(body))
-                        (func (export "answer") (result i32) i32.const 42))
-                    """)
-            ).instantiate(store: store)
+            let instance = try module.instantiate(store: store)
             let work = try #require(instance.exports[function: "work"])
             try stopAfterProgress(control, reason: reason) {
                 #expect(throws: reason) { try work() }
@@ -310,6 +300,160 @@ struct DirectExecutionControlTests {
         #expect(throws: ExecutionControlError.reusedControl) { try directStore(control) }
     }
 
+    // MARK: - The polling bound
+
+    /// Runs `export` once on a fresh controlled direct store and returns how many times the
+    /// controller was checked.
+    private func checks(_ wasm: [UInt8], _ export: String, _ arguments: [Value], pollingInterval: UInt32) throws -> UInt64 {
+        let control = try ExecutionControl(pollingInterval: pollingInterval, recordsCheckpoints: true)
+        let instance = try parseWasm(bytes: wasm, features: .all).instantiate(store: directStore(control))
+        let function = try #require(instance.exports[function: export])
+        _ = try function(arguments)
+        return control.observedCheckpointCount
+    }
+
+    /// Counts the WebAssembly operators `export` runs, with fuel metering on an uncontrolled store.
+    ///
+    /// Fuel charges each region in advance, so this equals the operators executed only for code
+    /// that runs every region to its end, which the bound fixtures below do.
+    private func operators(_ wasm: [UInt8], _ export: String, _ arguments: [Value]) throws -> UInt64 {
+        let store = Store(
+            engine: Engine(configuration: EngineConfiguration(threadingModel: .direct, features: .all, fuelMetering: true)))
+        store.fuel = Fuel(remaining: 1 << 40)
+        let instance = try parseWasm(bytes: wasm, features: .all).instantiate(store: store)
+        let function = try #require(instance.exports[function: export])
+        _ = try function(arguments)
+        return (1 << 40) - (store.fuel?.remaining ?? 0)
+    }
+
+    /// The polls a run made: its checks less those of a run that never polls.
+    private func polls(_ wasm: [UInt8], _ export: String, _ arguments: [Value], pollingInterval: UInt32) throws -> UInt64 {
+        try checks(wasm, export, arguments, pollingInterval: pollingInterval)
+            - checks(wasm, export, arguments, pollingInterval: .max)
+    }
+
+    /// Polls exactly once per polling interval of operators in straight-line code.
+    ///
+    /// A fresh store starts with a full budget, and every poll charges the segment it starts, so
+    /// `n` operators split into segments of one interval poll `ceil(n / interval) - 1` times.
+    ///
+    /// - Parameter pollingInterval: The operators between polls.
+    /// - Throws: Fixture construction or invocation failures.
+    @Test(arguments: [UInt32(16), 256])
+    func straightLineCodePollsOncePerInterval(pollingInterval: UInt32) throws {
+        let body = Array(repeating: "global.get 0 i32.const 1 i32.add global.set 0", count: 5_000).joined(separator: "\n")
+        let wasm = try wat2wasm("(module (global (mut i32) (i32.const 0)) (func (export \"work\") \(body)))")
+        let executed = try operators(wasm, "work", [])
+        #expect(executed == 20_000)
+        let interval = UInt64(pollingInterval)
+        #expect(try polls(wasm, "work", [], pollingInterval: pollingInterval) == (executed + interval - 1) / interval - 1)
+    }
+
+    /// Fixtures for the bound that run every region they enter to its end, so fuel counts exactly
+    /// the operators they execute.
+    private static let boundFixtures = Result {
+        try wat2wasm(
+            """
+            (module (global $g (mut i32) (i32.const 0))
+                (func $leaf (param $x i32) (result i32)
+                    (i32.add (i32.mul (local.get $x) (i32.const 3)) (global.get $g)))
+                (func (export "loop") (param $n i32) (local $i i32)
+                    (loop $next
+                        (global.set $g (i32.add (global.get $g) (local.get $i)))
+                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                        (br_if $next (i32.lt_u (local.get $i) (local.get $n)))))
+                (func (export "calls") (param $n i32) (local $i i32)
+                    (loop $next
+                        (global.set $g (call $leaf (local.get $i)))
+                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                        (br_if $next (i32.lt_u (local.get $i) (local.get $n)))))
+                (func $recurse (export "recurse") (param $n i32)
+                    (if (local.get $n)
+                        (then
+                            (global.set $g (i32.add (global.get $g) (i32.const 1)))
+                            (call $recurse (i32.sub (local.get $n) (i32.const 1)))
+                            (global.set $g (i32.add (global.get $g) (i32.const 2))))
+                        (else (global.set $g (i32.add (global.get $g) (i32.const 5))))))
+                (func (export "branches") (param $n i32) (local $i i32)
+                    (loop $next
+                        (if (i32.and (local.get $i) (i32.const 1))
+                            (then (global.set $g (i32.add (global.get $g) (i32.const 1))))
+                            (else (global.set $g (i32.sub (global.get $g) (i32.const 1)))))
+                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                        (br_if $next (i32.lt_u (local.get $i) (local.get $n))))))
+            """)
+    }
+
+    /// Polls at least once per polling interval of operators in loops, calls, recursion, and
+    /// branches, measured against the operators that fuel metering counts.
+    ///
+    /// With at most `interval` operators between two polls, `n` operators make at least
+    /// `ceil(n / interval) - 1` polls.
+    ///
+    /// - Parameters:
+    ///   - export: The fixture.
+    ///   - pollingInterval: The operators between polls.
+    /// - Throws: Fixture construction or invocation failures.
+    @Test(arguments: ["loop", "calls", "recurse", "branches"], [UInt32(16), 97, 1024])
+    func everyShapePollsWithinTheInterval(export: String, pollingInterval: UInt32) throws {
+        let wasm = try Self.boundFixtures.get()
+        let arguments = [Value.i32(export == "recurse" ? 400 : 3_000)]
+        let executed = try operators(wasm, export, arguments)
+        let interval = UInt64(pollingInterval)
+        let made = try polls(wasm, export, arguments, pollingInterval: pollingInterval)
+        #expect(made >= (executed + interval - 1) / interval - 1, "\(executed) operators, \(made) polls")
+    }
+
+    /// Polls in code that runs after a callee or a loop has already polled.
+    ///
+    /// A `mark` import records the controller's count. The code after it was translated before
+    /// the polls that precede it, so it polls only if returns and loop ends start new segments.
+    ///
+    /// - Parameter shape: `unwind` returns through 60 frames that each run 200 operators after
+    ///   the recursive call. `continuation` runs 800 operators after a loop ends.
+    /// - Throws: Fixture construction or invocation failures.
+    @Test(arguments: ["unwind", "continuation"])
+    func codeAfterAPollStillPolls(shape: String) throws {
+        let work = Array(repeating: "global.get $g i32.const 1 i32.add global.set $g", count: 50).joined(separator: "\n")
+        let tail = Array(repeating: "global.get $g i32.const 1 i32.add global.set $g", count: 200).joined(separator: "\n")
+        let wasm = try wat2wasm(
+            """
+            (module (import "host" "mark" (func $mark)) (global $g (mut i32) (i32.const 0))
+                (func $down (export "unwind") (param $n i32)
+                    (if (local.get $n)
+                        (then (call $down (i32.sub (local.get $n) (i32.const 1))) \(work))
+                        (else (call $mark))))
+                (func (export "continuation") (param $n i32) (local $i i32)
+                    (loop $next
+                        (if (i32.eq (local.get $i) (i32.sub (local.get $n) (i32.const 1))) (then (call $mark)))
+                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                        (br_if $next (i32.lt_u (local.get $i) (local.get $n))))
+                    \(tail)))
+            """)
+        // The checks after the mark: the polls in the code that follows it, plus the fixed checks
+        // of the import's return and of the invocation's completion.
+        func checksAfterMark(_ pollingInterval: UInt32) throws -> UInt64 {
+            let control = try ExecutionControl(pollingInterval: pollingInterval, recordsCheckpoints: true)
+            let store = try directStore(control)
+            let marked = Box<UInt64>(0)
+            var imports = Imports()
+            imports.define(
+                module: "host", name: "mark",
+                Function(store: store, parameters: []) { _, _ in
+                    marked.value = control.observedCheckpointCount
+                    return []
+                })
+            let instance = try parseWasm(bytes: wasm).instantiate(store: store, imports: imports)
+            let function = try #require(instance.exports[function: shape])
+            _ = try function([.i32(60)])
+            return control.observedCheckpointCount - marked.value
+        }
+        let after = try checksAfterMark(16) - checksAfterMark(.max)
+        // 60 frames of 200 operators, or 800 operators, at most 16 apart between polls.
+        let operatorsAfter: UInt64 = shape == "unwind" ? 60 * 200 : 800
+        #expect(after >= operatorsAfter / 16 - 1, "\(after) polls after the mark")
+    }
+
     #if WasmDebuggingSupport
         /// Refuses a debugger on a controlled direct store, whose debuggable code has no checkpoint.
         ///
@@ -332,6 +476,23 @@ struct DirectExecutionControlTests {
 
     /// The number of increments in the straight-line fixture, enough to outlast the watcher.
     private static let straightLineCount = 100_000
+
+    /// The fixtures of ``aStopEndsGuestCode(shape:reason:)``, parsed once per process.
+    private static let loopModule = Result { try fixture("(loop $again global.get 0 i32.const 1 i32.add global.set 0 (br $again))") }
+    private static let straightLineModule = Result {
+        try fixture(Array(repeating: "global.get 0 i32.const 1 i32.add global.set 0", count: straightLineCount).joined(separator: "\n"))
+    }
+
+    /// A module whose `work` export runs `body`, with a `count` global and an `answer` export.
+    private static func fixture(_ body: String) throws -> Module {
+        try parseWasm(
+            bytes: wat2wasm(
+                """
+                (module (global $count (export "count") (mut i32) (i32.const 0))
+                    (func (export "work") \(body))
+                    (func (export "answer") (result i32) i32.const 42))
+                """))
+    }
 
     /// Constructs a direct-threaded store with software bounds and all parser features.
     ///
@@ -380,7 +541,8 @@ struct DirectExecutionControlTests {
     /// - Throws: The fixture operation's own failure.
     private func watchdog(_ body: () throws -> Void) rethrows {
         let timer = DispatchSource.makeTimerSource(queue: .global())
-        timer.schedule(deadline: .now() + 30)
+        // Generous, because the sanitizer jobs run these fixtures several times slower.
+        timer.schedule(deadline: .now() + 120)
         timer.setEventHandler {
             FileHandle.standardError.write(Data("Direct control watchdog expired.\n".utf8))
             exit(124)

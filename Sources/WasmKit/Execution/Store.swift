@@ -107,8 +107,8 @@ public final class Store {
     /// Creates a store whose controller remains reachable outside its busy executor.
     ///
     /// A token-threaded store polls between dispatch groups. A direct-threaded store polls at
-    /// checkpoints that translation places at function entries, loop headers, `if` arms, and every
-    /// polling interval of operators within a longer region.
+    /// checkpoints that translation places in the guest code, at most one polling interval of
+    /// operators apart. See ``ExecutionControl/pollingInterval``.
     ///
     /// - Parameters:
     ///   - engine: The engine, with either threading model.

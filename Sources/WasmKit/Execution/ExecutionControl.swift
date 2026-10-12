@@ -13,10 +13,12 @@ public final class ExecutionControl: Sendable {
     /// native import return, and caught guest exceptions also check the external signal.
     /// A translated superinstruction can perform several WebAssembly operations in one dispatch.
     ///
-    /// A direct-threaded store counts WebAssembly operators instead of dispatches. Its checkpoints
-    /// sit at function entries, loop headers, `if` arms, and every interval of operators within a
-    /// longer region. Each one charges its segment in advance, so at most about twice the interval
-    /// runs between two polls.
+    /// A direct-threaded store counts WebAssembly operators instead of dispatches, one per operator
+    /// as fuel metering counts them. Its checkpoints sit at function entries, loop headers, `if`
+    /// arms, after calls, at the end labels of blocks that contain a checkpoint, and every interval
+    /// of operators within straight-line code. Each one charges its segment in advance, so from one
+    /// poll to the next the guest runs at most `pollingInterval` operators. Native work inside one
+    /// operator, such as a host import or a bulk memory operation, is not counted.
     public let pollingInterval: UInt32
     /// Whether this controller records checkpoints for cross-thread progress diagnostics.
     private let recordsCheckpoints: Bool

@@ -31,20 +31,26 @@ extension Execution {
         return nil
     }
 
-    /// Reads the controller, and on a live store refills the budget and continues with the
-    /// checkpoint's successor.
+    /// Reads the controller, and on a live store refills the budget less the segment that is
+    /// about to run, then continues with the checkpoint's successor.
     ///
     /// A pseudo-instruction: the translator never emits it, and `controlCheckpoint` reaches it by
     /// returning its head slot as the next instruction. By then the checkpoint has stepped `pc`
-    /// past its immediate and past its successor's head slot, so that head slot sits just before
-    /// `pc`, and `pc` is already where the successor expects it.
+    /// past its immediate and past its successor's head slot. So the successor's head slot sits
+    /// just before `pc`, the checkpoint's immediate just before that, and `pc` is already where
+    /// the successor expects it.
+    ///
+    /// Charging the segment here keeps the bound exact: from one poll to the next, the guest runs
+    /// at most one polling interval of operators.
     mutating func controlPoll(sp: Sp, pc: Pc) throws -> (Pc, CodeSlot) {
         let store = self.store.value
         guard let control = store.executionControl else {
             preconditionFailure("A control checkpoint ran on a store without an execution controller")
         }
         try control.check()
-        store.controlBudget.value = UInt64(control.pollingInterval)
+        let interval = UInt64(control.pollingInterval)
+        let segment = pc[-2]
+        store.controlBudget.value = interval >= segment ? interval - segment : 0
         return (pc, pc[-1])
     }
 }
