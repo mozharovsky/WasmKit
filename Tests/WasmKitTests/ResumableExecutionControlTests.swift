@@ -116,6 +116,10 @@ struct ResumableExecutionControlTests {
 
     // MARK: - Entry and native import boundaries
 
+    /// Refuses a resumable invocation of a stopped store before any guest code or import runs.
+    ///
+    /// - Parameter model: The dispatch model of the controlled store.
+    /// - Throws: Fixture construction or invocation failures.
     @Test(arguments: Self.models)
     func aStoppedStoreStartsNoResumableInvocation(model: EngineConfiguration.ThreadingModel) throws {
         let control = try ExecutionControl()
@@ -134,6 +138,13 @@ struct ResumableExecutionControlTests {
         case value, error, suspension
     }
 
+    /// Ends the invocation with the stop that an import requested, whatever the import then
+    /// returns, throws or asks for, and runs no guest code after the import.
+    ///
+    /// - Parameters:
+    ///   - model: The dispatch model of the controlled store.
+    ///   - variant: How the import ends and the reason it requests.
+    /// - Throws: Fixture construction or invocation failures.
     @Test(arguments: Self.models, Self.pairs(ImportOutcome.allCases, [ExecutionTermination.interrupted, .deadlineExceeded]))
     func aStopDuringTheImportOutranksItsOutcome(
         model: EngineConfiguration.ThreadingModel, _ variant: (outcome: ImportOutcome, reason: ExecutionTermination)
@@ -157,6 +168,11 @@ struct ResumableExecutionControlTests {
         #expect(control.termination == reason)
     }
 
+    /// Reports the stop, rather than the refused pause, of a host function that the embedder calls
+    /// directly and that requests a stop before it asks to pause.
+    ///
+    /// - Parameter model: The dispatch model of the controlled store.
+    /// - Throws: Fixture construction failures.
     @Test(arguments: Self.models)
     func aStopOutranksTheRefusalOfADirectHostPause(model: EngineConfiguration.ThreadingModel) throws {
         let control = try ExecutionControl()
@@ -174,6 +190,13 @@ struct ResumableExecutionControlTests {
         case firstRun, afterAResume
     }
 
+    /// Ends the invocation with the stop that a raw import requested before the import's mistyped
+    /// result reaches the guest, on the first run and after a resume.
+    ///
+    /// - Parameters:
+    ///   - model: The dispatch model of the controlled store.
+    ///   - variant: When the invocation reaches the import, and the reason the import requests.
+    /// - Throws: Fixture construction or invocation failures.
     @Test(arguments: Self.models, Self.pairs(RawImportMoment.allCases, [ExecutionTermination.interrupted, .deadlineExceeded]))
     func aStopOutranksTheResultsOfARawImport(
         model: EngineConfiguration.ThreadingModel, _ variant: (moment: RawImportMoment, reason: ExecutionTermination)
@@ -203,6 +226,10 @@ struct ResumableExecutionControlTests {
         #expect(store.resumableStackEnd == nil)
     }
 
+    /// Delivers a raw import's `v128` result to the guest after a resume on a live controlled store.
+    ///
+    /// - Parameter model: The dispatch model of the controlled store.
+    /// - Throws: Fixture construction or invocation failures.
     @Test(arguments: Self.models)
     func aRawImportDeliversItsResultsAfterAResume(model: EngineConfiguration.ThreadingModel) throws {
         let store = try Store(
@@ -217,6 +244,11 @@ struct ResumableExecutionControlTests {
         #expect(store.resumableStackEnd == nil)
     }
 
+    /// Ends the invocation with a stop that another thread requests while a long import runs, once
+    /// the import returns, and runs no guest code after the import.
+    ///
+    /// - Parameter model: The dispatch model of the controlled store.
+    /// - Throws: Fixture construction or invocation failures.
     @Test(arguments: Self.models)
     func aStopRequestedFromAnotherThreadDuringALongImportWins(model: EngineConfiguration.ThreadingModel) throws {
         let control = try ExecutionControl()
@@ -259,6 +291,11 @@ struct ResumableExecutionControlTests {
 
     // MARK: - Paused invocations after a stop
 
+    /// Ends a paused invocation with the stop at its resume, releases its state, and refuses later
+    /// entries of the store.
+    ///
+    /// - Parameter model: The dispatch model of the controlled store.
+    /// - Throws: Fixture construction or invocation failures.
     @Test(arguments: Self.models)
     func aStopDuringAPauseEndsTheInvocationAtItsResume(model: EngineConfiguration.ThreadingModel) throws {
         let control = try ExecutionControl()
@@ -281,6 +318,10 @@ struct ResumableExecutionControlTests {
         #expect(throws: ExecutionTermination.interrupted) { _ = try fixture.export("answer").invokeResumable() }
     }
 
+    /// Keeps a paused invocation after a stop until its owner cancels it, which releases it.
+    ///
+    /// - Parameter model: The dispatch model of the controlled store.
+    /// - Throws: Fixture construction or invocation failures.
     @Test(arguments: Self.models)
     func theOwnerCancelsAPausedInvocationAfterAStop(model: EngineConfiguration.ThreadingModel) throws {
         let control = try ExecutionControl()
@@ -312,6 +353,13 @@ struct ResumableExecutionControlTests {
         case staleFailure
     }
 
+    /// Ends a stopped invocation at a resume that a live store would refuse, so the stop outranks
+    /// each kind of refused completion.
+    ///
+    /// - Parameters:
+    ///   - model: The dispatch model of the controlled store.
+    ///   - completion: The completion that a live store would refuse.
+    /// - Throws: Fixture construction or invocation failures.
     @Test(arguments: Self.models, RefusedCompletion.allCases)
     func aStopOutranksTheRefusalOfAResume(model: EngineConfiguration.ThreadingModel, _ completion: RefusedCompletion) throws {
         let control = try ExecutionControl()
@@ -348,6 +396,11 @@ struct ResumableExecutionControlTests {
         try Self.expectNoEffectsAfterTheImport(fixture)
     }
 
+    /// Keeps a deadline that arrived first during a pause when a second stop follows, and reports it
+    /// at the resume and at later entries.
+    ///
+    /// - Parameter model: The dispatch model of the controlled store.
+    /// - Throws: Fixture construction or invocation failures.
     @Test(arguments: Self.models)
     func aDeadlineDuringAPauseKeepsItsReason(model: EngineConfiguration.ThreadingModel) throws {
         let control = try ExecutionControl()
@@ -368,6 +421,10 @@ struct ResumableExecutionControlTests {
 
     // MARK: - Polling after a resume
 
+    /// Stops a guest loop that starts after a resume, which shows that a resumed invocation polls.
+    ///
+    /// - Parameter model: The dispatch model of the controlled store.
+    /// - Throws: Fixture construction or invocation failures.
     @Test(arguments: Self.models)
     func aGuestLoopAfterAResumeStaysInterruptible(model: EngineConfiguration.ThreadingModel) throws {
         try watchdog {
@@ -404,6 +461,12 @@ struct ResumableExecutionControlTests {
 
     // MARK: - Pauses and validation under a controller
 
+    /// Keeps the frames, locals and effects of nested calls across several pauses on a live
+    /// controlled store, and keeps an exception handler across a pause, so that it catches the
+    /// exception the guest throws after the resume.
+    ///
+    /// - Parameter model: The dispatch model of the controlled stores.
+    /// - Throws: Fixture construction or invocation failures.
     @Test(arguments: Self.models)
     func severalPausesUnderAControllerKeepFramesLocalsAndEffects(model: EngineConfiguration.ThreadingModel) throws {
         let control = try ExecutionControl()
@@ -430,6 +493,11 @@ struct ResumableExecutionControlTests {
         #expect(try ResumableCallTests.finished(try outer.resume(returning: [.i32(5)], in: exceptions.store)) == [.i32(15)])
     }
 
+    /// Refuses stale, foreign, miscounted and mistyped completions on live stores without
+    /// disturbing either paused invocation, which then finish with their own results.
+    ///
+    /// - Parameter model: The dispatch model of the controlled stores.
+    /// - Throws: Fixture construction or invocation failures.
     @Test(arguments: Self.models)
     func invalidCompletionsLeaveOtherLiveContinuationsIntact(model: EngineConfiguration.ThreadingModel) throws {
         let first = try Self.controlled(model, try ExecutionControl())
@@ -586,6 +654,11 @@ struct ResumableExecutionControlTests {
 
     // MARK: - Ownership and independent stores
 
+    /// Releases every paused invocation over repeated cycles that end with a resume, a cancel, a
+    /// failure or a stop.
+    ///
+    /// - Parameter model: The dispatch model of the controlled stores.
+    /// - Throws: Fixture construction or invocation failures.
     @Test(arguments: Self.models)
     func repeatedCyclesUnderAControllerReleaseEveryInvocation(model: EngineConfiguration.ThreadingModel) throws {
         var released: [() -> Bool] = []
@@ -622,6 +695,11 @@ struct ResumableExecutionControlTests {
         #expect(released.allSatisfy { $0() })
     }
 
+    /// Ends the paused invocation of a stopped store and lets the paused invocation of another
+    /// store finish.
+    ///
+    /// - Parameter model: The dispatch model of the controlled stores.
+    /// - Throws: Fixture construction or invocation failures.
     @Test(arguments: Self.models)
     func stoppingOneStoreLeavesAnotherRunning(model: EngineConfiguration.ThreadingModel) throws {
         let stopped = try ExecutionControl()
@@ -643,6 +721,9 @@ struct ResumableExecutionControlTests {
         #expect(second.calls["after"] == [[.i32(2)]])
     }
 
+    /// Accepts a controller on a token-threaded and on a direct-threaded store.
+    ///
+    /// - Throws: Controller configuration failures.
     @Test
     func controlledStoresAcceptBothModels() throws {
         for model in Self.models {
