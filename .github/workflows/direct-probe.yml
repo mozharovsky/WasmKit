@@ -1,7 +1,8 @@
 name: Direct execution probe
 
-# Measures token, controlled token and direct dispatch on one GitHub-hosted machine per run. The
-# probe lives on its research branch only, so the workflow runs on pushes to that branch.
+# Measures token, controlled token, direct and controlled direct dispatch on one GitHub-hosted
+# machine per run. The probe lives on its research branch only, so the workflow runs on pushes to
+# that branch. BASE_REVISION is the control base whose unchanged paths the probe compares against.
 on:
   push:
     branches: [direct-execution-probe]
@@ -15,6 +16,7 @@ env:
   WASM_SDK_SHA256: f07b7be3c586d92d7a07051fc6d303b87ebea67eadc40640ba59d5a8b79aa86d
   TOOLCHAIN: /Library/Developer/Toolchains/swift-6.4.0-RELEASE.xctoolchain
   BENCHMARK_DISABLE_JEMALLOC: "true"
+  BASE_REVISION: ac035e8b28b9c3d73afe5e93cd4d623b6e12382a
 
 jobs:
   phase-a:
@@ -71,6 +73,18 @@ jobs:
           bin=$(xcrun swift build -c release --package-path Benchmarks/DirectProbe/Host --show-bin-path)
           echo "BENCH=$bin/DirectProbeBench" >> "$GITHUB_ENV"
           shasum -a 256 "$bin/DirectProbeBench" | tee -a probe-out/hashes.txt
+      - name: Build the harness against the base revision in Release
+        if: contains(env.PROBE_ONLY, 'regression')
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_REVISION"
+          git worktree add --detach "$RUNNER_TEMP/base" "$BASE_REVISION"
+          rsync -a --exclude .build Benchmarks/DirectProbe "$RUNNER_TEMP/base/Benchmarks/"
+          xcrun swift build -c release --package-path "$RUNNER_TEMP/base/Benchmarks/DirectProbe/Host" \
+            > probe-out/base-host-build.log 2>&1 || { tail -80 probe-out/base-host-build.log; exit 1; }
+          bin=$(xcrun swift build -c release --package-path "$RUNNER_TEMP/base/Benchmarks/DirectProbe/Host" --show-bin-path)
+          echo "BASE_BENCH=$bin/DirectProbeBench" >> "$GITHUB_ENV"
+          echo "base $(git -C "$RUNNER_TEMP/base" rev-parse HEAD)" | tee -a probe-out/hashes.txt
+          shasum -a 256 "$bin/DirectProbeBench" | tee -a probe-out/hashes.txt
       - name: Build the WasmiBenchmarks replay in Release
         run: |
           ./Vendor/checkout-dependency wasmi-benchmarks
@@ -80,11 +94,13 @@ jobs:
           echo "WASMI=$bin/WasmiBenchmarks" >> "$GITHUB_ENV"
           shasum -a 256 "$bin/WasmiBenchmarks" | tee -a probe-out/hashes.txt
           git -C Vendor/wasmi-benchmarks rev-parse HEAD | tee -a probe-out/hashes.txt
-      - name: Run phase A
+      - name: Run the measurements
         run: |
           python3 Benchmarks/DirectProbe/scripts/run.py \
             --bench "$BENCH" --wasm probe-out/ProbeGuest.wasm --out probe-out/results \
             --wasmi "$WASMI" --wasmi-root Vendor/wasmi-benchmarks \
+            --variants "$PROBE_VARIANTS" ${BASE_BENCH:+--base-bench "$BASE_BENCH"} \
+            --regression-pairs "$PROBE_REGRESSION_PAIRS" --latency-samples "$PROBE_LATENCY_SAMPLES" \
             --only "$PROBE_ONLY" --processes "$PROBE_PROCESSES" --rounds "$PROBE_ROUNDS" \
             --samples "$PROBE_SAMPLES" --warmup "$PROBE_WARMUP" --cold "$PROBE_COLD" \
             --wasmi-rounds "$PROBE_WASMI_ROUNDS" --wasmi-warmup-ms "$PROBE_WASMI_WARMUP_MS" \
@@ -98,8 +114,39 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: phase-a-${{ github.sha }}
+          name: probe-${{ github.sha }}
           path: probe-out
+
+  sanitizers:
+    runs-on: xcode-27
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [thread, address]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load probe parameters
+        run: grep -v '^#' Benchmarks/DirectProbe/ci.env | grep . >> "$GITHUB_ENV"
+      - name: Select Xcode 27.0
+        if: env.RUN_SANITIZERS == '1'
+        run: sudo xcode-select -s /Applications/Xcode_27.0.app
+      - name: Install the test dependencies
+        if: env.RUN_SANITIZERS == '1'
+        run: ./Vendor/checkout-dependency --category default
+      - name: Run the control suites under the sanitizer
+        if: env.RUN_SANITIZERS == '1'
+        run: |
+          mkdir -p sanitizer-out
+          set -o pipefail
+          xcrun swift test --sanitize ${{ matrix.sanitizer }} \
+            --filter "DirectExecutionControlTests|ExecutionInterruptionTests|SpectestTests" \
+            2>&1 | tee sanitizer-out/${{ matrix.sanitizer }}.log
+      - uses: actions/upload-artifact@v4
+        if: always() && env.RUN_SANITIZERS == '1'
+        with:
+          name: sanitizer-${{ matrix.sanitizer }}-${{ github.sha }}
+          path: sanitizer-out
 
   release-suite:
     runs-on: xcode-27
