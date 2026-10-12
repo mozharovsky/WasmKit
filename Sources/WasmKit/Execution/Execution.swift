@@ -725,8 +725,9 @@ extension Execution {
                     throw exception
                 }
                 guard let trap = error as? Trap else {
-                    if error is EndOfExecution {
-                        try store.value.executionControl?.check()
+                    // Every invocation ends here, so a store without a controller skips the cast.
+                    if let control = store.value.executionControl, error is EndOfExecution {
+                        try control.check()
                     }
                     throw error
                 }
