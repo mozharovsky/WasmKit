@@ -3,6 +3,10 @@ name: Direct execution probe
 # Measures token, controlled token, direct and controlled direct dispatch on one GitHub-hosted
 # machine per run. The probe lives on its research branch only, so the workflow runs on pushes to
 # that branch. BASE_REVISION is the control base whose unchanged paths the probe compares against.
+#
+# Later measurements moved to a dedicated Devbox, so a push runs nothing unless its head commit
+# message contains [probe-ci]. That keeps an explicit way to run the jobs without starting
+# duplicate benchmark jobs on every push.
 on:
   push:
     branches: [direct-execution-probe]
@@ -20,6 +24,7 @@ env:
 
 jobs:
   phase-a:
+    if: contains(github.event.head_commit.message, '[probe-ci]')
     runs-on: xcode-27
     timeout-minutes: 180
     # Only the timing job is replaced by a newer push. A running suite job finishes.
@@ -118,6 +123,7 @@ jobs:
           path: probe-out
 
   sanitizers:
+    if: contains(github.event.head_commit.message, '[probe-ci]')
     runs-on: xcode-27
     timeout-minutes: 150
     strategy:
@@ -149,6 +155,7 @@ jobs:
           path: sanitizer-out
 
   release-suite:
+    if: contains(github.event.head_commit.message, '[probe-ci]')
     runs-on: xcode-27
     timeout-minutes: 150
     steps:
