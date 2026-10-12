@@ -143,7 +143,7 @@ Currently, the minimum supported version is Swift 6.3. When possible, our goal i
 
 ## Cooperative execution control
 
-This fork provides a per-store stop signal for token execution. See
+This fork provides a per-store stop signal for token and direct execution. See
 [Cooperative execution control](Documentation/ExecutionControl.md) for its ownership, checkpoint,
 and native-call boundaries.
 

@@ -109,6 +109,8 @@ public final class Store {
     /// The checkpoints that translation places for such a store charge their segment's operator
     /// count here, and an exhausted budget dispatches to the poll that refills it. In a ``Cell``
     /// for the same reason as ``remainingFuel``. Token-threaded and uncontrolled stores never read it.
+    /// The budget carries across calls, nested host entries and resumable pauses, and only a poll
+    /// refills it.
     let controlBudget: Cell<UInt64>
 
     /// Create a new store associated with the given engine.
@@ -124,7 +126,9 @@ public final class Store {
     ///
     /// A token-threaded store polls between dispatch groups. A direct-threaded store polls at
     /// checkpoints that translation places in the guest code, at most one polling interval of
-    /// operators apart. See ``ExecutionControl/pollingInterval``.
+    /// operators apart. Debuggable instances, whose code has no checkpoints, are refused on a
+    /// direct-threaded store with a controller. See ``ExecutionControl/pollingInterval`` for the
+    /// units of each model.
     ///
     /// - Parameters:
     ///   - engine: The engine, with either threading model.

@@ -115,7 +115,7 @@ public enum ExecutionTermination: Error, Equatable, Sendable, CustomStringConver
 
 /// Configuration failures reported before an execution controller can be used by a store.
 public enum ExecutionControlError: Error, Equatable, Sendable {
-    /// A zero interval would make the grouped dispatcher unable to reach its next checkpoint.
+    /// A zero interval would let no guest work run between two polls.
     case invalidPollingInterval
     /// A controller cannot be used by more than one store, including replacement stores.
     case reusedControl

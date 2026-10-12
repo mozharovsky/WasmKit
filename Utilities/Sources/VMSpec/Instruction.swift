@@ -1812,9 +1812,10 @@ extension VMGen {
                 Emitted only for a direct-threaded store with an execution controller, at the
                 heads of the regions that fuel metering charges, after calls, at the end labels
                 of blocks that contain a checkpoint, and every polling interval of operators in
-                straight-line code. The immediate is the operator count of the segment. An
-                exhausted budget dispatches to `controlPoll` rather than calling, so that the
-                per-iteration charge of a loop stays a straight-line handler.
+                straight-line code. The immediate is the number of operators in the segment,
+                counting the ones that fuel leaves free. An exhausted budget dispatches to
+                `controlPoll` rather than calling, so that the per-iteration charge of a loop
+                stays a straight-line handler.
                 """,
             immediateLayout: .controlCheckpoint
         )
@@ -1823,8 +1824,8 @@ extension VMGen {
         var controlPoll = Instruction(
             name: "controlPoll",
             documentation: """
-                Check the store's execution controller and refill its budget. Dispatched to by
-                `controlCheckpoint`; never emitted.
+                Check the store's execution controller and refill its budget. Only
+                `controlCheckpoint` dispatches to it, and translation never emits it.
 
                 Control-shaped so that it receives the program counter, which already points past
                 the head slot of the checkpoint's successor. A live store charges the segment and

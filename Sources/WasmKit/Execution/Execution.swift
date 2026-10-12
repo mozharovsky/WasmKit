@@ -653,8 +653,9 @@ extension Execution {
     /// Starts the main execution loop using the direct threading model.
     ///
     /// A controlled store polls inside the handler chain at the checkpoints translation placed for
-    /// it. This loop adds the checks the token polling loop makes outside its groups: before a
-    /// caught guest exception reaches its handler and before completion is reported.
+    /// it. This loop adds the checks that the token polling loop makes outside its groups. One
+    /// comes before a caught guest exception reaches its handler, and one before completion is
+    /// reported.
     @inline(never)
     mutating func runDirectThreaded(
         sp: Sp, pc: Pc, md: Md, ms: Ms

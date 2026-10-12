@@ -2575,11 +2575,11 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
     let funcTypeInterner: Interner<FunctionType>
     let engineConfiguration: EngineConfiguration
     var module: InternalInstance
-    /// The fuel region being translated, when the engine meters fuel or the store is
-    /// checkpointed; `nil` otherwise.
+    /// The fuel region being translated, or nil when the engine meters no fuel and the store is
+    /// not checkpointed.
     private var fuelRegion: FuelRegion?
-    /// The polling interval of the store's controller, when this function polls through
-    /// `controlCheckpoint` instructions; `nil` otherwise.
+    /// The polling interval of the store's controller, or nil when this function does not poll
+    /// through `controlCheckpoint` instructions.
     ///
     /// Only a direct-threaded store with a controller is checkpointed. A token-threaded store polls
     /// between dispatch groups instead, and a debuggable instance emits no direct-only instruction.
@@ -2780,10 +2780,10 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
     /// Segments are what make the polling bound exact. Code is entered only at a segment's
     /// checkpoint, so the operators run between two checkpoints never exceed the first one's
     /// charge. A new segment therefore starts wherever execution can arrive after another
-    /// checkpoint ran: after a call returns, after a nested region ends, and at the end label of
-    /// a frame that contains a checkpoint. The checkpoint is emitted between two operators and out
-    /// of the rewinder's reach, like a region's meter, so no fusion and no accumulator hand-off
-    /// spans it.
+    /// checkpoint ran. That is after a call returns, after a nested region ends, and at the end
+    /// label of a frame that contains a checkpoint. The checkpoint is emitted between two
+    /// operators and out of the rewinder's reach, like a region's meter, so no fusion and no
+    /// accumulator hand-off spans it.
     private mutating func startControlSegment() {
         guard controlCheckpointInterval != nil, var region = fuelRegion, let controlMeter = region.controlMeter else {
             return

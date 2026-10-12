@@ -334,7 +334,7 @@ struct DirectExecutionControlTests {
         return (1 << 40) - (store.fuel?.remaining ?? 0)
     }
 
-    /// The polls a run made: its checks less those of a run that never polls.
+    /// The polls a run made, which are its checks less those of a run that never polls.
     private func polls(_ wasm: [UInt8], _ export: String, _ arguments: [Value], pollingInterval: UInt32) throws -> UInt64 {
         try checks(wasm, export, arguments, pollingInterval: pollingInterval)
             - checks(wasm, export, arguments, pollingInterval: .max)
@@ -440,8 +440,8 @@ struct DirectExecutionControlTests {
                         (br_if $next (i32.lt_u (local.get $i) (local.get $n))))
                     \(tail)))
             """)
-        // The checks after the mark: the polls in the code that follows it, plus the fixed checks
-        // of the import's return and of the invocation's completion.
+        // The checks after the mark are the polls in the code that follows it, plus the fixed
+        // checks of the import's return and of the invocation's completion.
         func checksAfterMark(_ pollingInterval: UInt32) throws -> UInt64 {
             let control = try ExecutionControl(pollingInterval: pollingInterval, recordsCheckpoints: true)
             let store = try directStore(control)
@@ -517,9 +517,9 @@ struct DirectExecutionControlTests {
     ///
     /// Each iteration also runs the eight operators of ``counter``. `nops` adds 1,000 `nop`s.
     /// `blocks` adds 250 blocks that each hold one `nop`, three operators apiece. `arms` adds 100
-    /// `if`s whose arms each hold one `nop`. Either arm runs six operators: three for the
-    /// condition, the `if`, the `nop`, and the `else` or `end` that closes the arm. Fuel prices
-    /// only the condition and the `if`.
+    /// `if`s whose arms each hold one `nop`. Either arm runs six operators. Three evaluate the
+    /// condition, and then come the `if`, the `nop`, and the `else` or `end` that closes the arm.
+    /// Fuel prices only the condition and the `if`.
     private static let freeLoops = Result {
         try wat2wasm(
             """
@@ -709,8 +709,8 @@ struct DirectExecutionControlTests {
     /// Recursions whose frames run a tail after a merge label once their callee returns.
     ///
     /// The deepest frame calls `mark`. Every frame then reaches its tail through one kind of
-    /// merge: the end of an `if`, a `br` or `br_table` to a block's end, a caught exception, or
-    /// the end of a loop.
+    /// merge, which is the end of an `if`, a `br` or `br_table` to a block's end, a caught
+    /// exception, or the end of a loop.
     private static func mergeModule(_ kind: String) throws -> [UInt8] {
         try wat2wasm(
             """

@@ -134,10 +134,10 @@ extension TestCase {
     ///   - skip: Why each directive to skip is skipped, keyed by the line it starts on.
     ///     Skipping a module also skips the directives that use it.
     ///   - executionControl: An unclaimed controller for this script, or nil for an ordinary store.
-    ///     A controller requires token threading and cannot be reused after the store claims it,
-    ///     including when setup or a directive fails.
+    ///     The store polls it under either threading model. It cannot be reused after the store
+    ///     claims it, including when setup or a directive fails.
     ///   - handler: The synchronous receiver of each directive result and located parsing failure.
-    /// - Throws: Invalid controller configuration, support-module instantiation failure, or a script
+    /// - Throws: A reused controller, support-module instantiation failure, or a script
     ///   parsing failure that has no source location to report through the handler.
     func run(
         spectestModule: Module, configuration: EngineConfiguration, skip: [Int: String] = [:],
