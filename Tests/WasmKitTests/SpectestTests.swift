@@ -77,6 +77,26 @@ struct SpectestTests {
             )
         }
 
+        /// Exercises every specification case through a direct-threaded store with a live
+        /// controller, with software bounds.
+        ///
+        /// An interval of one ends a control segment after every operator, so a checkpoint sits
+        /// between almost every two operators and the poll runs at every other one. A fusion or an
+        /// accumulator hand-off that a checkpoint broke would change a result here.
+        ///
+        /// - Parameters:
+        ///   - test: A specification fixture with its own store and controller lifetime.
+        ///   - pollingInterval: The operators the controller allows between polls.
+        /// - Throws: Fixture construction or specification conformance failures.
+        @Test(arguments: try SpectestTests.testCases(in: SpectestTests.testPaths), [UInt32(1), 1024])
+        func runWithDirectExecutionControl(test: TestCase, pollingInterval: UInt32) throws {
+            try Self.run(
+                test: test,
+                configuration: EngineConfiguration(threadingModel: .direct, memoryBoundsChecking: .software),
+                executionControl: ExecutionControl(pollingInterval: pollingInterval)
+            )
+        }
+
         @Test(
             .disabled("unable to run spectest on Android due to missing files on emulator", platforms: [.android]),
             arguments: try SpectestTests.testCases(in: SpectestTests.testPaths + SpectestTests.sharedMemoryTestPaths)

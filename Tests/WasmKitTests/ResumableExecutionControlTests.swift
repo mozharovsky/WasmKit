@@ -12,6 +12,11 @@ import WAT
 /// each paused invocation and ends it by resuming or cancelling it.
 @Suite(.serialized)
 struct ResumableExecutionControlTests {
+    /// The dispatch model of every controlled store here. The direct-control probe runs this suite
+    /// once with `WASMKIT_CONTROL_MODEL=direct`.
+    static let model: EngineConfiguration.ThreadingModel =
+        ProcessInfo.processInfo.environment["WASMKIT_CONTROL_MODEL"] == "direct" ? .direct : .token
+
     typealias Fixture = ResumableCallTests.Fixture
     typealias HostFailure = ResumableCallTests.HostFailure
 
@@ -48,7 +53,7 @@ struct ResumableExecutionControlTests {
         pause: @escaping (Fixture, [Value]) throws -> [Value] = ResumableCallTests.pause
     ) throws -> Fixture {
         try Fixture(
-            effects, threadingModel: .token, fuel: fuel, executionControl: control,
+            effects, threadingModel: Self.model, fuel: fuel, executionControl: control,
             hosts: ["before": { _, _ in [] }, "pause": pause, "after": { _, _ in [] }])
     }
 
@@ -149,7 +154,7 @@ struct ResumableExecutionControlTests {
     func aStopOutranksTheRefusalOfADirectHostPause() throws {
         let control = try ExecutionControl()
         let store = try Store(
-            engine: Engine(configuration: EngineConfiguration(threadingModel: .token)), executionControl: control)
+            engine: Engine(configuration: EngineConfiguration(threadingModel: Self.model)), executionControl: control)
         let pausing = Function(store: store, parameters: [], results: [.i32]) { _, _ in
             control.requestInterruption()
             throw HostCallSuspension(tag: 1)
@@ -168,7 +173,7 @@ struct ResumableExecutionControlTests {
     ) throws {
         let control = try ExecutionControl()
         let store = try Store(
-            engine: Engine(configuration: EngineConfiguration(threadingModel: .token, features: .all)),
+            engine: Engine(configuration: EngineConfiguration(threadingModel: Self.model, features: .all)),
             executionControl: control)
         let instance = try Self.rawImportInstance(store: store) { results in
             control.requestInterruption(reason: reason)
@@ -193,7 +198,7 @@ struct ResumableExecutionControlTests {
     @Test
     func aRawImportDeliversItsResultsAfterAResume() throws {
         let store = try Store(
-            engine: Engine(configuration: EngineConfiguration(threadingModel: .token, features: .all)),
+            engine: Engine(configuration: EngineConfiguration(threadingModel: Self.model, features: .all)),
             executionControl: ExecutionControl())
         let value = V128(bytes: Array(1...16))
         let instance = try Self.rawImportInstance(store: store) { results in results[0] = .v128(value) }
@@ -395,7 +400,7 @@ struct ResumableExecutionControlTests {
     func severalPausesUnderAControllerKeepFramesLocalsAndEffects() throws {
         let control = try ExecutionControl()
         let fixture = try Fixture(
-            ResumableCallTests.nested, threadingModel: .token, executionControl: control,
+            ResumableCallTests.nested, threadingModel: Self.model, executionControl: control,
             hosts: ["pause": ResumableCallTests.pause, "effect": { _, _ in [] }])
         let first = try ResumableCallTests.suspended(try fixture.export("run").invokeResumable([.i32(3)]))
         #expect(first.arguments == [.i32(30)])
@@ -404,14 +409,14 @@ struct ResumableExecutionControlTests {
         #expect(second.arguments == [.i32(65)])
         #expect(fixture.calls["effect"] == [[.i32(1)], [.i32(2)]])
         let results = try ResumableCallTests.finished(try second.resume(returning: [.i32(130)], in: fixture.store))
-        #expect(results == [.i32(UInt32(bitPattern: try ResumableCallTests.nestedReference(3, threadingModel: .token)))])
+        #expect(results == [.i32(UInt32(bitPattern: try ResumableCallTests.nestedReference(3, threadingModel: Self.model)))])
         #expect(fixture.count("pause") == 2)
         #expect(fixture.calls["effect"] == [[.i32(1)], [.i32(2)]])
         #expect(try fixture.export("writes")() == [.i32(2)])
 
         let exceptionControl = try ExecutionControl()
         let exceptions = try Fixture(
-            ResumableCallEngineTests.exceptions, threadingModel: .token, features: [.exceptionHandling],
+            ResumableCallEngineTests.exceptions, threadingModel: Self.model, features: [.exceptionHandling],
             executionControl: exceptionControl, hosts: ["pause": ResumableCallTests.pause])
         let outer = try ResumableCallTests.suspended(try exceptions.export("outer").invokeResumable())
         #expect(try ResumableCallTests.finished(try outer.resume(returning: [.i32(5)], in: exceptions.store)) == [.i32(15)])
@@ -502,10 +507,10 @@ struct ResumableExecutionControlTests {
     }
 
     @Test
-    func controlledStoresStayTokenOnly() throws {
-        let direct = Engine(configuration: EngineConfiguration(threadingModel: .direct))
-        #expect(throws: ExecutionControlError.unsupportedThreadingModel) {
-            try Store(engine: direct, executionControl: try ExecutionControl())
+    func controlledStoresAcceptBothModels() throws {
+        for model in [EngineConfiguration.ThreadingModel.token, .direct] {
+            let engine = Engine(configuration: EngineConfiguration(threadingModel: model))
+            _ = try Store(engine: engine, executionControl: try ExecutionControl())
         }
     }
 

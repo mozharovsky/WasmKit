@@ -415,7 +415,8 @@ struct WasmFunctionEntity {
                 locals: code.locals,
                 functionIndex: index,
                 codeSize: code.expression.count,
-                isIntercepting: engine.interceptor != nil
+                isIntercepting: engine.interceptor != nil,
+                controlPollingInterval: store.executionControl?.pollingInterval
             ).translate(code: code)
         }
         self.code = .compiled(iseq)

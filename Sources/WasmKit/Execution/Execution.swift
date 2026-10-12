@@ -651,6 +651,10 @@ extension Execution {
     }
 
     /// Starts the main execution loop using the direct threading model.
+    ///
+    /// A controlled store polls inside the handler chain at the checkpoints translation placed for
+    /// it. This loop adds the checks the token polling loop makes outside its groups: before a
+    /// caught guest exception reaches its handler and before completion is reported.
     @inline(never)
     mutating func runDirectThreaded(
         sp: Sp, pc: Pc, md: Md, ms: Ms
@@ -713,12 +717,16 @@ extension Execution {
                 self.resetError()
 
                 if let exception = error as? WasmKitException {
+                    try store.value.executionControl?.check()
                     if handleException(exception, sp: &sp, pc: &pc, md: &md, ms: &ms) {
                         continue
                     }
                     throw exception
                 }
                 guard let trap = error as? Trap else {
+                    if error is EndOfExecution {
+                        try store.value.executionControl?.check()
+                    }
                     throw error
                 }
                 // Attach backtrace if the thrown error is a trap
