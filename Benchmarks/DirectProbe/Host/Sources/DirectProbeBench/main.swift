@@ -45,6 +45,7 @@ struct Options {
             case "--chatter": options.sizes.chatter = try number(argument)
             case "--action-rounds": options.sizes.actionRounds = try number(argument)
             case "--seed": options.sizes.seed = try number(argument)
+            case "--polling-interval": Variant.pollingInterval = try number(argument)
             default: throw ProbeError("unknown argument \(argument)\n\(usage)")
             }
         }
@@ -62,6 +63,7 @@ struct Options {
           --samples n          timed samples of each case in each turn
           --scale n --batch n --chatter n --action-rounds n --seed n
           --seconds s          duration of the spin mode
+          --polling-interval n the interval of the controlled variants (default 1024)
         """
 }
 
@@ -307,7 +309,7 @@ func runLatency(_ options: Options, module: Module) throws -> Bool {
     let variant = options.variants[0]
     guard variant.controlled else { throw ProbeError("latency needs a controlled variant") }
     let engine = variant.makeEngine()
-    emit("kind,variant,mode,sample,nanoseconds,ok")
+    emit("kind,variant,interval,mode,sample,nanoseconds,ok")
     var allOK = true
     for mode in ["guest", "native"] {
         for sample in 0..<options.samples {
@@ -339,7 +341,9 @@ func runLatency(_ options: Options, module: Module) throws -> Bool {
             }
             let ok = outcome.value.ok
             if !ok { allOK = false }
-            emit("latency,\(variant.name),\(mode),\(sample),\(outcome.value.end &- requested),\(ok ? 1 : 0)")
+            emit(
+                "latency,\(variant.name),\(Variant.pollingInterval),\(mode),\(sample),"
+                    + "\(outcome.value.end &- requested),\(ok ? 1 : 0)")
         }
     }
     return allOK

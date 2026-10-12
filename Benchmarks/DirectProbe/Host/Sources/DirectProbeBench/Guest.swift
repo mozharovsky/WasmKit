@@ -34,6 +34,9 @@ struct Variant: Sendable, Hashable {
     static let directFuel = Variant(
         name: "direct-fuel", threadingModel: .direct, memoryBoundsChecking: .software, controlled: false, fuel: true)
 
+    /// The polling interval of every controlled variant in this process.
+    static var pollingInterval: UInt32 = 1024
+
     static let all: [Variant] = [.token, .tokenControl, .direct, .directControl, .directMprotect, .tokenFuel, .directFuel]
 
     static func named(_ name: String) throws -> Variant {
@@ -132,7 +135,7 @@ final class GuestInstance {
         let control: ExecutionControl?
         let store: Store
         if variant.controlled {
-            let created = try ExecutionControl()
+            let created = try ExecutionControl(pollingInterval: Variant.pollingInterval)
             control = created
             store = try Store(engine: engine, executionControl: created)
         } else {
