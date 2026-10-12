@@ -20,6 +20,11 @@ COMPARISONS = [
     ("token-control", "token", "control: token-control / token"),
     ("direct", "token-control", "potential: direct / token-control"),
 ]
+CONTROLLED = [
+    ("direct-control", "direct", "direct control: direct-control / direct"),
+    ("direct-control", "token-control", "candidate: direct-control / token-control"),
+]
+VARIANT_ORDER = ["token", "token-control", "direct", "direct-control"]
 BOUNDS = [("direct-mprotect", "direct", "bounds: direct-mprotect / direct")]
 FUEL = [
     ("token-fuel", "token-control", "token-fuel / token-control"),
@@ -152,7 +157,7 @@ def summarize_wasmi(results):
             values = [results[(r, variant)][case] for r in rounds if case in results.get((r, variant), {})]
             if values:
                 entry["variants"][variant] = describe(values)
-        for numerator, denominator, label in COMPARISONS:
+        for numerator, denominator, label in COMPARISONS + CONTROLLED:
             ratios = []
             for r in rounds:
                 a = results.get((r, numerator), {}).get(case)
@@ -165,7 +170,7 @@ def summarize_wasmi(results):
                 entry["ratios"][label] = stats
         summary[case] = entry
     geomeans = {}
-    for numerator, denominator, label in COMPARISONS:
+    for numerator, denominator, label in COMPARISONS + CONTROLLED:
         per_round = []
         for r in rounds:
             logs = []
@@ -205,7 +210,7 @@ def main():
 
     if os.path.isdir(os.path.join(out, "warm")):
         medians, bad = read_warm(os.path.join(out, "warm"))
-        warm = summarize_warm(medians, COMPARISONS)
+        warm = summarize_warm(medians, COMPARISONS + CONTROLLED)
         report["warm"] = warm
         report["warm_bad_samples"] = bad
         lines += ["## Warm Swift-WASM cases", "",
@@ -214,10 +219,71 @@ def main():
                   "| --- | ---: | ---: | ---: | --- | --- | --- |"]
         for case, entry in sorted(warm.items()):
             v = entry["variants"]
+            if "harness" in v:
+                h = v["harness"]
+                lines.append(f"| {case} (per call, no guest) | {fmt_ns(h['median'])} ({fmt_ns(h['min'])}–{fmt_ns(h['max'])}) | | | | | |")
+                continue
             cells = [fmt_ns(v[name]["median"]) if name in v else "" for name in ["token", "token-control", "direct"]]
             ratios = [ratio_cell(entry["ratios"][label]) if label in entry["ratios"] else ""
                       for _, _, label in COMPARISONS]
             lines.append(f"| {case} | " + " | ".join(cells + ratios) + " |")
+        lines.append("")
+        if any(label in entry["ratios"] for entry in warm.values() for _, _, label in CONTROLLED):
+            lines += ["### Controlled direct", "",
+                      "| Case | token-control | direct | direct-control | " + " | ".join(l for _, _, l in CONTROLLED) + " |",
+                      "| --- | ---: | ---: | ---: | --- | --- |"]
+            for case, entry in sorted(warm.items()):
+                v = entry["variants"]
+                if "harness" in v:
+                    continue
+                cells = [fmt_ns(v[name]["median"]) if name in v else "" for name in ["token-control", "direct", "direct-control"]]
+                ratios = [ratio_cell(entry["ratios"][label]) if label in entry["ratios"] else "" for _, _, label in CONTROLLED]
+                lines.append(f"| {case} | " + " | ".join(cells + ratios) + " |")
+            lines.append("")
+
+    if os.path.isdir(os.path.join(out, "latency")):
+        samples = defaultdict(list)
+        bad = 0
+        for path in sorted(glob.glob(os.path.join(out, "latency", "*.csv"))):
+            with open(path) as file:
+                for row in csv.DictReader(line for line in file if not line.startswith("#")):
+                    if row["ok"] != "1":
+                        bad += 1
+                        continue
+                    samples[(row["variant"], row["mode"])].append(int(row["nanoseconds"]))
+        report["latency"] = {f"{v}/{m}": describe(values) for (v, m), values in samples.items()}
+        lines += ["## Stop latency", "", f"Failed samples: {bad}. Time from the request to the throw.", "",
+                  "| Variant | Mode | n | median | p90 | max |", "| --- | --- | ---: | ---: | ---: | ---: |"]
+        for (variant, mode), values in sorted(samples.items()):
+            lines.append(f"| {variant} | {mode} | {len(values)} | {fmt_ns(statistics.median(values))} | "
+                         f"{fmt_ns(quantile(values, 0.9))} | {fmt_ns(max(values))} |")
+        lines.append("")
+
+    if os.path.isdir(os.path.join(out, "regression")):
+        per_side = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+        for path in sorted(glob.glob(os.path.join(out, "regression", "*.csv"))):
+            pair, side = os.path.basename(path)[:-4].split("-")
+            with open(path) as file:
+                rows = [line for line in file if not line.startswith("#")]
+            groups = defaultdict(list)
+            for row in csv.DictReader(rows):
+                if row["kind"] != "sample" or row["ok"] != "1" or row["variant"] == "harness":
+                    continue
+                groups[(int(row["round"]), row["variant"], row["case"])].append(int(row["nanoseconds"]) / int(row["units"]))
+            for (round_index, variant, case), values in groups.items():
+                per_side[(variant, case)][int(pair)][side].append(statistics.median(values))
+        lines += ["## Unchanged paths, head / base", "",
+                  "Each pair runs the base and head harness in alternating processes. A ratio compares the",
+                  "medians of one pair's rounds.", "", "| Variant | Case | head / base |", "| --- | --- | --- |"]
+        report["regression"] = {}
+        for (variant, case), pairs in sorted(per_side.items()):
+            ratios = [statistics.median(sides["head"]) / statistics.median(sides["base"])
+                      for sides in pairs.values() if sides.get("head") and sides.get("base")]
+            if ratios:
+                stats = describe(ratios)
+                stats["verdict"] = verdict(stats)
+                report["regression"][f"{variant}/{case}"] = stats
+                lines.append(f"| {variant} | {case} | {ratio_cell(stats)} |")
         lines.append("")
 
     if os.path.isdir(os.path.join(out, "bounds")):
@@ -228,6 +294,8 @@ def main():
                   "| Case | direct | direct-mprotect | ratio |", "| --- | ---: | ---: | --- |"]
         for case, entry in sorted(bounds.items()):
             v = entry["variants"]
+            if "direct" not in v or "direct-mprotect" not in v:
+                continue
             label = BOUNDS[0][2]
             lines.append(
                 f"| {case} | {fmt_ns(v['direct']['median'])} | {fmt_ns(v['direct-mprotect']['median'])} | "
@@ -243,6 +311,8 @@ def main():
                   "| --- | ---: | ---: | ---: | --- | --- | --- |"]
         for case, entry in sorted(fuel.items()):
             v = entry["variants"]
+            if "harness" in v:
+                continue
             cells = [fmt_ns(v[name]["median"]) if name in v else "" for name in ["token-control", "direct", "direct-fuel"]]
             ratios = [ratio_cell(entry["ratios"][label]) if label in entry["ratios"] else "" for _, _, label in FUEL]
             lines.append(f"| {case} | " + " | ".join(cells + ratios) + " |")

@@ -24,6 +24,8 @@ struct Variant: Sendable, Hashable {
     static let tokenControl = Variant(
         name: "token-control", threadingModel: .token, memoryBoundsChecking: .software, controlled: true)
     static let direct = Variant(name: "direct", threadingModel: .direct, memoryBoundsChecking: .software, controlled: false)
+    static let directControl = Variant(
+        name: "direct-control", threadingModel: .direct, memoryBoundsChecking: .software, controlled: true)
     static let directMprotect = Variant(
         name: "direct-mprotect", threadingModel: .direct, memoryBoundsChecking: .mprotect, controlled: false)
 
@@ -32,7 +34,7 @@ struct Variant: Sendable, Hashable {
     static let directFuel = Variant(
         name: "direct-fuel", threadingModel: .direct, memoryBoundsChecking: .software, controlled: false, fuel: true)
 
-    static let all: [Variant] = [.token, .tokenControl, .direct, .directMprotect, .tokenFuel, .directFuel]
+    static let all: [Variant] = [.token, .tokenControl, .direct, .directControl, .directMprotect, .tokenFuel, .directFuel]
 
     static func named(_ name: String) throws -> Variant {
         guard let variant = all.first(where: { $0.name == name }) else {
@@ -240,6 +242,12 @@ final class GuestInstance {
                 results[0] = .i64(ProbeMath.lookup(parameters[0].i64))
             }))
         imports.define(
+            module: "probe", name: "block",
+            Function(store: store, parameters: [.i32], results: [], raw: { _, parameters, _ in
+                state.importCalls &+= 1
+                usleep(parameters[0].i32)
+            }))
+        imports.define(
             module: "probe", name: "note",
             Function(store: store, parameters: [.i64], results: [], raw: { _, parameters, _ in
                 state.importCalls &+= 1
@@ -257,6 +265,7 @@ enum ProbeExport: String, CaseIterable {
     case chatter = "probe_chatter"
     case longAction = "probe_long_action"
     case spin = "probe_spin"
+    case blocking = "probe_blocking"
 }
 
 /// A monotonic clock in nanoseconds.

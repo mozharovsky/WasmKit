@@ -21,7 +21,11 @@ WASMI_VARIANTS = {
     "token": ["--token", "--software-bounds"],
     "token-control": ["--token", "--software-bounds", "--control"],
     "direct": ["--software-bounds"],
+    "direct-control": ["--software-bounds", "--control"],
 }
+SPIN_SYMBOLS = ["wasmkit_tc_", "runDirectThreaded", "runTokenThreaded", "startTokenThreaded",
+                "runDispatchGroups", "doExecute", "wasmkit_trap_guard_run", "wasmkit_tc_controlCheckpoint",
+                "controlPoll"]
 
 
 def log(message):
@@ -106,8 +110,7 @@ def spin_proof(runner, bench, wasm, variant, out):
     counts = {}
     if os.path.exists(sample_path):
         text = open(sample_path, errors="replace").read()
-        for symbol in ["wasmkit_tc_", "runDirectThreaded", "runTokenThreaded", "startTokenThreaded",
-                       "runDispatchGroups", "doExecute", "wasmkit_trap_guard_run"]:
+        for symbol in SPIN_SYMBOLS:
             counts[symbol] = len(re.findall(re.escape(symbol), text))
     runner.steps.append({
         "name": name, "command": command, "status": status, "sample_status": sampled.returncode,
@@ -134,7 +137,13 @@ def main():
     parser.add_argument("--wasmi-measure-ms", type=int, default=1000)
     parser.add_argument("--size", action="append", default=[], help="extra size flags for the bench")
     parser.add_argument("--only", default="verify,spin,warm,bounds,cold,wasmi")
+    parser.add_argument("--variants", default="token,token-control,direct")
+    parser.add_argument("--base-bench", help="the harness built against the base revision")
+    parser.add_argument("--regression-pairs", type=int, default=3)
+    parser.add_argument("--latency-samples", type=int, default=30)
     args = parser.parse_args()
+    global MAIN_VARIANTS
+    MAIN_VARIANTS = args.variants.split(",")
 
     out = os.path.abspath(args.out)
     os.makedirs(out, exist_ok=True)
@@ -145,7 +154,7 @@ def main():
 
     if "verify" in only:
         runner.run("verify", [args.bench, "verify", "--wasm", args.wasm, "--variants",
-                              "token,token-control,direct,direct-mprotect"],
+                              ",".join(MAIN_VARIANTS + ["direct-mprotect"])],
                    timeout=1200, stdout_path=os.path.join(out, "verify.txt"))
         if runner.failed:
             log("verification failed; timings are not taken")
@@ -153,7 +162,7 @@ def main():
             return 1
 
     if "spin" in only and platform.system() == "Darwin":
-        for variant in ["token", "token-control", "direct", "direct-mprotect"]:
+        for variant in MAIN_VARIANTS + ["direct-mprotect"]:
             spin_proof(runner, args.bench, args.wasm, variant, out)
 
     if "warm" in only:
@@ -177,6 +186,28 @@ def main():
                               "token-control,direct-fuel,direct,token-fuel", "--rounds", str(args.rounds),
                               "--samples", str(args.samples), "--warmup", str(args.warmup)] + sizes,
                    timeout=3600, stdout_path=os.path.join(out, "fuel", "process-0.csv"))
+
+    if "latency" in only:
+        controlled = [v for v in MAIN_VARIANTS if v.endswith("-control")]
+        for index in range(2):
+            for variant in (controlled if index % 2 == 0 else list(reversed(controlled))):
+                runner.run(f"latency-{index}-{variant}",
+                           [args.bench, "latency", "--wasm", args.wasm, "--variant", variant,
+                            "--samples", str(args.latency_samples // 2)],
+                           timeout=900, stdout_path=os.path.join(out, "latency", f"{index}-{variant}.csv"))
+
+    if "regression" in only and args.base_bench:
+        unchanged = [v for v in MAIN_VARIANTS if v != "direct-control"]
+        for pair in range(args.regression_pairs):
+            order = [("base", args.base_bench), ("head", args.bench)]
+            if pair % 2 == 1:
+                order.reverse()
+            for side, bench in order:
+                runner.run(f"regression-{pair}-{side}",
+                           [bench, "warm", "--wasm", args.wasm, "--variants", ",".join(unchanged),
+                            "--rounds", str(max(2, args.rounds // 2)), "--samples", str(args.samples),
+                            "--warmup", str(args.warmup)] + sizes,
+                           timeout=3600, stdout_path=os.path.join(out, "regression", f"{pair}-{side}.csv"))
 
     if "cold" in only:
         for iteration in range(args.cold):

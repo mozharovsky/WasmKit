@@ -6,7 +6,7 @@ import PackageDescription
 // exports listed here, which the linker would otherwise drop from an executable.
 let exports = [
     "probe_compute", "probe_collections", "probe_text", "probe_tiny", "probe_chatter",
-    "probe_long_action", "probe_spin",
+    "probe_long_action", "probe_spin", "probe_blocking",
 ]
 
 let package = Package(

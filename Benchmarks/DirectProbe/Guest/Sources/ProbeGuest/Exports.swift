@@ -16,6 +16,10 @@ func _probeLookup(_ key: UInt64) -> UInt64
 @_extern(c)
 func _probeNote(_ value: UInt64)
 
+@_extern(wasm, module: "probe", name: "block")
+@_extern(c)
+func _probeBlock(_ microseconds: UInt32)
+
 /// Answers workload host services through the module's imports.
 struct ImportedHost: ProbeHost {
     @inline(__always)
@@ -72,6 +76,19 @@ public func probeLongAction(_ rounds: Int32, _ seed: Int32, _ unit: Int32) -> In
 
 /// The value the spin exports read on every iteration, so the optimizer keeps their loops.
 nonisolated(unsafe) var probeSpinLimit: UInt64 = .max
+
+/// Calls a blocking import in a loop until the host stops the store, so a stop arrives while
+/// native code runs. Used only by interruption checks.
+@_expose(wasm, "probe_blocking")
+@_cdecl("probe_blocking")
+public func probeBlocking(_ microseconds: Int32) -> Int64 {
+    var calls: UInt64 = 0
+    while calls < probeSpinLimit {
+        _probeBlock(UInt32(bitPattern: microseconds))
+        calls &+= 1
+    }
+    return Int64(bitPattern: calls)
+}
 
 /// Loops until the host stops the store. Used only by interruption checks.
 @_expose(wasm, "probe_spin")

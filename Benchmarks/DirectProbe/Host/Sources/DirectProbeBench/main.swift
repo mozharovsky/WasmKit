@@ -3,6 +3,7 @@
 #else
     import Glibc
 #endif
+import Dispatch
 import WasmKit
 
 // The harness of the direct-execution probe. See ../../README.md for the modes and the output.
@@ -52,9 +53,10 @@ struct Options {
     }
 
     static let usage = """
-        usage: DirectProbeBench <verify|warm|cold|spin> --wasm <ProbeGuest.wasm> [options]
-          --variants a,b,c     token, token-control, direct, direct-mprotect (warm, verify)
-          --variant v          one variant (cold, spin)
+        usage: DirectProbeBench <verify|warm|cold|spin|latency> --wasm <ProbeGuest.wasm> [options]
+          --variants a,b,c     token, token-control, direct, direct-control, direct-mprotect,
+                               token-fuel, direct-fuel (warm, verify)
+          --variant v          one variant (cold, spin, latency)
           --rounds n           paired rounds of the warm measurement
           --warmup n           discarded samples before each case in each turn
           --samples n          timed samples of each case in each turn
@@ -290,6 +292,59 @@ func runSpin(_ options: Options, module: Module) throws -> Bool {
     return allOK
 }
 
+/// A value that crosses to the worker thread of the latency measurement, which the semaphores order.
+final class Handoff<Value>: @unchecked Sendable {
+    var value: Value
+    init(_ value: Value) { self.value = value }
+}
+
+/// Measures how long a requested stop takes to end a running guest on a controlled variant.
+///
+/// The guest-bound case spins in `probe_spin`, so only checkpoints can observe the stop. The
+/// native-bound case calls an import that blocks for 20 ms, which has to return before the stop is
+/// observed. Each sample uses a fresh store, because a stop retires its store.
+func runLatency(_ options: Options, module: Module) throws -> Bool {
+    let variant = options.variants[0]
+    guard variant.controlled else { throw ProbeError("latency needs a controlled variant") }
+    let engine = variant.makeEngine()
+    emit("kind,variant,mode,sample,nanoseconds,ok")
+    var allOK = true
+    for mode in ["guest", "native"] {
+        for sample in 0..<options.samples {
+            let guest = Handoff(try GuestInstance(module: module, variant: variant, engine: engine))
+            guard let control = guest.value.control else { throw ProbeError("no controller") }
+            let function = guest.value.function(mode == "guest" ? .spin : .blocking)
+            let arguments = [Value(signed: Int32(mode == "guest" ? 1 : 20_000))]
+            let started = DispatchSemaphore(value: 0)
+            let finished = DispatchSemaphore(value: 0)
+            let outcome = Handoff<(end: UInt64, ok: Bool)>((0, false))
+            DispatchQueue.global(qos: .userInitiated).async {
+                started.signal()
+                var ok = false
+                do {
+                    _ = try guest.value.call(function, arguments)
+                } catch let termination as ExecutionTermination {
+                    ok = termination == .interrupted
+                } catch {}
+                outcome.value = (MonotonicTime.now(), ok)
+                finished.signal()
+            }
+            started.wait()
+            usleep(5_000)
+            let requested = MonotonicTime.now()
+            control.requestInterruption()
+            guard finished.wait(timeout: .now() + 10) == .success else {
+                report("TIMEOUT latency \(variant.name) \(mode) sample \(sample)")
+                return false
+            }
+            let ok = outcome.value.ok
+            if !ok { allOK = false }
+            emit("latency,\(variant.name),\(mode),\(sample),\(outcome.value.end &- requested),\(ok ? 1 : 0)")
+        }
+    }
+    return allOK
+}
+
 do {
     let options = try Options.parse(CommandLine.arguments)
     let bytes = try readModule(options.wasm)
@@ -299,6 +354,7 @@ do {
     case "cold": ok = try runCold(options, bytes: bytes)
     case "verify": ok = try runVerify(options, module: try parseWasm(bytes: bytes))
     case "spin": ok = try runSpin(options, module: try parseWasm(bytes: bytes))
+    case "latency": ok = try runLatency(options, module: try parseWasm(bytes: bytes))
     default: throw ProbeError(Options.usage)
     }
     exit(ok ? 0 : 1)
