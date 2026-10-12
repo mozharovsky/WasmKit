@@ -1,0 +1,13 @@
+diff --git a/Sources/WasmKit/Execution/Execution.swift b/Sources/WasmKit/Execution/Execution.swift
+index f8385ed..fb59b2b 100644
+--- a/Sources/WasmKit/Execution/Execution.swift
++++ b/Sources/WasmKit/Execution/Execution.swift
+@@ -993,7 +993,7 @@ extension Execution {
+             let saved = SavedSlots(of: sp)
+             Self.moveArguments(from: argumentSlots, to: parameterArea, slotCount: layout.parameterSlotCount)
+             saved.store(below: newSp)
+-            try invokeHostFunction(function: host, sp: newSp, parameterArea: parameterArea, pc: pc)
++            try invokeHostFunction(function: host, sp: sp, parameterArea: parameterArea, pc: pc)
+             if let instance = newSp.currentInstance {
+                 CurrentMemory.mayUpdateCurrentInstance(instance: instance, md: &md, ms: &ms)
+             }

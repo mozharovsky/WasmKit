@@ -1,0 +1,13 @@
+diff --git a/Sources/WasmKit/Execution/ResumableCall.swift b/Sources/WasmKit/Execution/ResumableCall.swift
+index afaefc5..071b6d2 100644
+--- a/Sources/WasmKit/Execution/ResumableCall.swift
++++ b/Sources/WasmKit/Execution/ResumableCall.swift
+@@ -423,7 +423,7 @@ final class ResumableExecutionState {
+                     try execution.runDirectThreaded(sp: sp, pc: pc, md: md, ms: ms)
+                 case .token:
+                     // The entry point chooses the polling loop of a controlled store.
+-                    try execution.startTokenThreaded(sp: sp, pc: pc, md: md, ms: ms)
++                    try execution.runTokenThreaded(sp: &sp, pc: &pc, md: &md, ms: &ms)
+                 }
+             } catch is Execution.EndOfExecution {
+                 return

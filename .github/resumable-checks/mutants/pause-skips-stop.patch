@@ -1,0 +1,13 @@
+diff --git a/Sources/WasmKit/Execution/Execution.swift b/Sources/WasmKit/Execution/Execution.swift
+index f8385ed..b868b18 100644
+--- a/Sources/WasmKit/Execution/Execution.swift
++++ b/Sources/WasmKit/Execution/Execution.swift
+@@ -1211,6 +1211,8 @@ extension Execution {
+                         stackEnd: stackEnd)
+                 }
+             }
++        } catch let paused as SuspendedHostCall {
++            throw paused
+         } catch {
+             // A requested stop outranks the host's failure, a result that the array-based
+             // adapter rejected, and a request to pause.

@@ -1,0 +1,83 @@
+diff --git a/Sources/WasmKit/Execution/ResumableCall.swift b/Sources/WasmKit/Execution/ResumableCall.swift
+index 45e3c8c..c0f4ab0 100644
+--- a/Sources/WasmKit/Execution/ResumableCall.swift
++++ b/Sources/WasmKit/Execution/ResumableCall.swift
+@@ -2,14 +2,17 @@ import struct WasmTypes.FunctionType
+ 
+ /// An error a host function throws to pause the resumable invocation that called it.
+ ///
+-/// Throwing it from a host function that ``Function/invokeResumable(_:)`` reached pauses the
+-/// invocation at that call and returns ``ResumableCall/suspended(_:)`` to the embedder. The
+-/// guest keeps the synchronous signature of its import. It continues from the call with the
+-/// results the embedder passes to ``SuspendedCall/resume(returning:completing:in:)``.
++/// Throwing it from a host function that the guest of a resumable invocation calls pauses that
++/// invocation at the call. The embedder receives the continuation as
++/// ``ResumableCall/suspended(_:)`` from ``Function/invokeResumable(_:)``, or as
++/// ``ResumeResult/suspended(_:)`` when the pause follows a resume. The guest keeps the
++/// synchronous signature of its import. It continues from the call with the results the embedder
++/// passes to ``SuspendedCall/resume(returning:completing:in:)``.
+ ///
+-/// Any other invocation, including a synchronous call that a host function makes into a guest,
+-/// cannot pause. There the request fails with ``ResumableCallError/suspensionUnavailable``. A
+-/// request passed to ``SuspendedCall/resume(throwing:in:)`` fails the same way.
++/// Any other invocation cannot pause. This includes a synchronous call that a host function
++/// makes into a guest and a host function that the embedder calls directly. There the request
++/// fails with ``ResumableCallError/suspensionUnavailable``. A request passed to
++/// ``SuspendedCall/resume(throwing:in:)`` fails the same way.
+ public struct HostCallSuspension: Error, Sendable, Equatable {
+     /// A value the embedder chooses to recognize the request, reported by ``SuspendedCall/tag``.
+     public var tag: UInt64
+@@ -26,10 +29,11 @@ public struct HostCallSuspension: Error, Sendable, Equatable {
+ public enum ResumableCallError: Error, Sendable, Equatable {
+     /// A host function asked to pause an invocation that cannot pause.
+     ///
+-    /// Only the invocation that ``Function/invokeResumable(_:)`` started can pause, and only at a
+-    /// host call that it makes itself. A pause inside a synchronous call nested in a host
++    /// Only an invocation that ``Function/invokeResumable(_:)`` started can pause, and only at a
++    /// host call that its own guest makes. A pause inside a synchronous call nested in a host
+     /// function would have to keep that host function's native frames, which the engine does
+-    /// not keep.
++    /// not keep. A host function that the embedder calls directly has no guest invocation to
++    /// pause.
+     case suspensionUnavailable
+     /// ``Function/invokeResumable(_:)`` was called on a host function, which has no guest frames
+     /// to keep.
+@@ -39,7 +43,8 @@ public enum ResumableCallError: Error, Sendable, Equatable {
+ /// The identity of one pause of a resumable invocation.
+ ///
+ /// Each pause receives a new identifier. The embedder sends it along with the work it starts
+-/// and passes it back when it resumes, so a result that arrives for an earlier pause is refused.
++/// and passes it back when it resumes, so a result that arrives for an earlier pause or for
++/// another invocation is refused.
+ /// Identifiers stay unique within the process for as long as any copy of them exists.
+ public struct SuspensionID: Hashable, Sendable {
+     /// The identity of the store that paused, kept alive by the identifier.
+@@ -83,7 +88,10 @@ public enum ResumeResult: ~Copyable {
+ 
+ /// The reason a resume was refused before the guest ran.
+ public enum ResumeRejection: Error, Sendable, Equatable {
+-    /// The completion names an earlier pause than the one this continuation holds.
++    /// The completion names another pause than the one this continuation holds.
++    ///
++    /// The other pause can be an earlier pause of the same invocation or a pause of another
++    /// invocation, including one that has already been released.
+     case staleSuspension
+     /// The store passed to resume is not the store that paused.
+     case foreignStore
+@@ -470,6 +478,16 @@ extension Function {
+     /// returned ``SuspendedCall`` continues the guest from the call once the embedder has the
+     /// host function's results, on whichever executor owns the store.
+     ///
++    /// Each invocation allocates a guest stack of the size the engine is configured for. It keeps
++    /// the stack until the guest returns or fails, or until the embedder releases the
++    /// continuation.
++    ///
++    /// A host function that this invocation calls can start a resumable invocation of its own.
++    /// That invocation runs on its own stack, and it pauses and resumes independently of this one.
++    /// A synchronous call that a host function makes into a guest cannot pause. A host function
++    /// that such a call reaches and that asks to pause fails with
++    /// ``ResumableCallError/suspensionUnavailable``.
++    ///
+     /// - Parameter arguments: The arguments to pass to the function.
+     /// - Returns: The finished results or the first pause.
+     /// - Throws: A trap or an error that ends the invocation,

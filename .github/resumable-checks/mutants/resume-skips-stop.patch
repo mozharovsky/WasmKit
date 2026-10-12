@@ -1,0 +1,12 @@
+diff --git a/Sources/WasmKit/Execution/ResumableCall.swift b/Sources/WasmKit/Execution/ResumableCall.swift
+index afaefc5..0ce7b56 100644
+--- a/Sources/WasmKit/Execution/ResumableCall.swift
++++ b/Sources/WasmKit/Execution/ResumableCall.swift
+@@ -154,7 +154,6 @@ public struct SuspendedCall: ~Copyable {
+     public consuming func resume(
+         returning results: [Value], completing id: SuspensionID, in store: Store
+     ) throws -> ResumeResult {
+-        try checkExecutionControl()
+         if let rejection = rejection(completing: id, store: store) {
+             return .rejected(self, rejection)
+         }

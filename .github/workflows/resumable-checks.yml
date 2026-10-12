@@ -1,0 +1,123 @@
+name: Resumable checks
+
+# Targeted checks for the resumable host call pull request that the main matrix does not run:
+# negative controls, ThreadSanitizer, DocC, and the core without execution control.
+on:
+  push:
+    branches: [resumable-host-calls-0-4-2-checks]
+
+env:
+  WASMKIT_WARNINGS_AS_ERRORS: "1"
+
+jobs:
+  negative-controls:
+    runs-on: ubuntu-24.04
+    container:
+      image: swift:6.3-noble
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - control: baseline
+            filter: "ResumableCallTests|ResumableCallEngineTests|ResumableExecutionControlTests"
+            expect: pass
+          - control: resume-inner-loop
+            filter: ResumableExecutionControlTests
+            expect: 'Test aGuestLoopAfterAResumeStaysInterruptible\(\) (failed|recorded an issue)'
+          - control: resume-skips-stop
+            filter: ResumableExecutionControlTests
+            expect: 'Test aStopOutranksTheRefusalOfAResume\(_:\) recorded an issue.*stalePause'
+          - control: resume-throwing-skips-stop
+            filter: ResumableExecutionControlTests
+            expect: 'Test aStopOutranksTheRefusalOfAResume\(_:\) recorded an issue.*staleFailure'
+          - control: pause-skips-stop
+            filter: ResumableExecutionControlTests
+            expect: 'Test aStopDuringTheImportOutranksItsOutcome\(_:_:\) recorded an issue.*suspension'
+          - control: direct-pause-skips-stop
+            filter: ResumableExecutionControlTests
+            expect: 'Test aStopOutranksTheRefusalOfADirectHostPause\(\) (failed|recorded an issue)'
+          - control: tail-old-frame
+            filter: aTailCallThatMovesTheFrameResumesInTheMovedFrame
+            expect: 'signal code 11|signal 11|aTailCallThatMovesTheFrameResumesInTheMovedFrame\(_:\) recorded an issue'
+    name: "negative-control (${{ matrix.control }})"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+      - name: Run the control
+        shell: bash
+        run: .github/resumable-checks/control.sh "${{ matrix.control }}" "${{ matrix.filter }}" "${{ matrix.expect }}"
+
+  tsan:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - name: Select Xcode version
+        run: sudo xcode-select -switch /Applications/Xcode_26.5.app
+      - name: Test under ThreadSanitizer
+        shell: bash
+        run: |
+          swift --version
+          swift test --sanitize thread \
+            --traits FileSystem,MultiThread,ComponentModel,WasmDebuggingSupport,Disassembler \
+            --filter 'ResumableCallTests|ResumableCallEngineTests|ResumableExecutionControlTests|ExecutionInterruptionTests|DebuggerInterruptionBoundaryTests|ExecutionControlExitTests' \
+            2>&1 | tee "$RUNNER_TEMP/tsan.log"
+          status=${PIPESTATUS[0]}
+          grep -E 'Test run with|ThreadSanitizer|recorded an issue' "$RUNNER_TEMP/tsan.log" | sort -u
+          if grep -q 'ThreadSanitizer' "$RUNNER_TEMP/tsan.log"; then
+            echo "::error::ThreadSanitizer reported a race"
+            exit 1
+          fi
+          exit "$status"
+
+  docc:
+    runs-on: macos-26
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [head, base, upstream, core]
+    name: "docc (${{ matrix.variant }})"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Select Xcode version
+        run: sudo xcode-select -switch /Applications/Xcode_26.5.app
+      - name: Keep the check scripts
+        run: cp -R .github/resumable-checks "$RUNNER_TEMP/rc"
+      - name: Check out the variant
+        shell: bash
+        run: '"$RUNNER_TEMP/rc/variant.sh" "${{ matrix.variant }}"'
+      - name: Build the documentation
+        shell: bash
+        run: '"$RUNNER_TEMP/rc/docc.sh" "${{ matrix.variant }}"'
+
+  core-variant:
+    runs-on: ubuntu-24.04
+    container:
+      image: swift:6.3-noble
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Keep the check scripts
+        run: cp -R .github/resumable-checks "$RUNNER_TEMP/rc"
+      - name: Check out the core
+        shell: bash
+        run: '"$RUNNER_TEMP/rc/variant.sh" core'
+      - name: Check formatting
+        shell: bash
+        run: |
+          apt-get update && apt-get install -y python3
+          ./Utilities/format.py
+          git diff --exit-code
+      - name: Run the resumable suites without execution control
+        shell: bash
+        run: |
+          swift --version
+          swift test --traits FileSystem,MultiThread,ComponentModel,WasmDebuggingSupport,Disassembler \
+            --filter 'ResumableCallTests|ResumableCallEngineTests'

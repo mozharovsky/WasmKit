@@ -1,0 +1,12 @@
+diff --git a/Sources/WasmKit/Execution/Function.swift b/Sources/WasmKit/Execution/Function.swift
+index bd410bf..3aedba3 100644
+--- a/Sources/WasmKit/Execution/Function.swift
++++ b/Sources/WasmKit/Execution/Function.swift
+@@ -299,7 +299,6 @@ extension InternalFunction {
+                 }
+             }
+         } catch is HostCallSuspension {
+-            try store.executionControl?.check()
+             throw ResumableCallError.suspensionUnavailable
+         } catch {
+             try store.executionControl?.check()
