@@ -2389,8 +2389,14 @@ struct InstructionTranslator: ~Copyable, InstructionVisitor {
         /// `local.tee` of `high` pushes its local above `low` without dropping the offer.
         mutating func emitPair(low: VReg, high: VReg, _ make: @escaping PairRelink) {
             emit(make(low, high), resultRelink: { make(low, $0) })
-            lastEmission?.relinkedResult = high
-            lastEmission?.lowerRelink = LowerRelink(result: low, make: { high in { make($0, high) } })
+            // The emission is replaced as a whole. Swift 6.3.2 with assertions rejects
+            // optional-chained stores into its fields with a SIL memory lifetime failure.
+            guard let emission = lastEmission else { return }
+            lastEmission = LastEmission(
+                position: emission.position, end: emission.end, resultRelink: emission.resultRelink,
+                fusable: nil, binary: nil, relinkedResult: high,
+                lowerRelink: LowerRelink(result: low, make: { high in { make($0, high) } })
+            )
         }
 
         mutating func putLabel() -> LabelRef {
