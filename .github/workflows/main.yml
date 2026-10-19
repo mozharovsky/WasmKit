@@ -319,15 +319,20 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: espressif/idf:v5.5
+    env:
+      # This job has its own snapshot. The shared DEV_SNAPSHOT cannot compile
+      # WasmKit for Embedded Swift, which needs key paths there. Snapshots from
+      # 2026-10-17 on call allocation and output hooks of the Embedded runtime
+      # that the example's platform layer does not define. This one passed the
+      # job on 2026-10-13 and 2026-10-16.
+      ESP32_SNAPSHOT: swift-DEVELOPMENT-SNAPSHOT-2026-10-11-a
     steps:
       - uses: actions/checkout@v6
       - name: Install Swift development snapshot
         run: |
           apt-get update && apt-get install -y libcurl4 libedit2 libxml2 libsqlite3-0 libz3-4 zlib1g libncurses6
-          dir=$(curl -sSL https://download.swift.org/development/ubuntu2204/latest-build.yml | sed -n 's/^dir: //p')
-          download=$(curl -sSL https://download.swift.org/development/ubuntu2204/latest-build.yml | sed -n 's/^download: //p')
           mkdir -p /opt/swift
-          curl -sSL "https://download.swift.org/development/ubuntu2204/$dir/$download" \
+          curl -fsSL "https://download.swift.org/development/ubuntu2204/$ESP32_SNAPSHOT/$ESP32_SNAPSHOT-ubuntu22.04.tar.gz" \
             | tar xz -C /opt/swift --strip-components 1
       - name: Install QEMU
         run: |
