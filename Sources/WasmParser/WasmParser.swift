@@ -166,6 +166,8 @@ public struct WasmFeatureSet: OptionSet, Sendable {
         case multiMemory
         /// The WebAssembly garbage collection proposal
         case gc
+        /// The WebAssembly wide arithmetic proposal
+        case wideArithmetic
 
         /// The bit this proposal occupies in a feature set. The values are part
         /// of the stored representation, so they must stay stable.
@@ -181,6 +183,7 @@ public struct WasmFeatureSet: OptionSet, Sendable {
             case .functionReferences: 6
             case .multiMemory: 7
             case .gc: 8
+            case .wideArithmetic: 9
             }
         }
     }
@@ -218,6 +221,9 @@ public struct WasmFeatureSet: OptionSet, Sendable {
     /// The WebAssembly garbage collection proposal
     @_alwaysEmitIntoClient
     public static var gc: WasmFeatureSet { WasmFeatureSet(.gc) }
+    /// The WebAssembly wide arithmetic proposal
+    @_alwaysEmitIntoClient
+    public static var wideArithmetic: WasmFeatureSet { WasmFeatureSet(.wideArithmetic) }
 
     /// The default feature set
     public static let `default`: WasmFeatureSet = [.referenceTypes, .exceptionHandling]
@@ -713,6 +719,18 @@ extension Parser: BinaryInstructionDecoder {
         throw makeError(.illegalOpcode(opcode))
     }
 
+    /// Reports the prefix and the opcode in its shortest encoding, whichever length the binary used.
+    @inlinable func throwUnknown(prefix: UInt8, opcode: UInt32) throws(WasmParserError) -> Never {
+        var bytes = [prefix]
+        var rest = opcode
+        repeat {
+            let byte = UInt8(rest & 0x7F)
+            rest >>= 7
+            bytes.append(rest == 0 ? byte : byte | 0x80)
+        } while rest != 0
+        throw makeError(.illegalOpcode(bytes))
+    }
+
     @inlinable func visitUnknown(_ opcode: [UInt8]) throws(WasmParserError) -> Bool {
         try throwUnknown(opcode)
     }
@@ -1026,6 +1044,9 @@ extension Parser: BinaryInstructionDecoder {
     }
     @inlinable mutating func claimNextByte() throws(WasmParserError) -> UInt8 {
         return try stream.consumeAny()
+    }
+    @inlinable mutating func claimPrefixedOpcode() throws(WasmParserError) -> UInt32 {
+        return try parseUnsigned()
     }
 
     /// Parse a single binary instruction.
