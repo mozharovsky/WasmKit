@@ -4,9 +4,9 @@ import WasmParser
 
 @testable import WasmKit
 
-/// Suspending a ``ResumableCall`` at a host call, and completing that host call later.
+/// Tests for suspending a ``ResumableCall`` at a host call and resuming it later.
 ///
-/// The host functions record every run, so a test can tell a continued call from a replayed one.
+/// The host functions record every run, so a test can check that resuming does not run them again.
 @Suite
 struct ResumableHostCallTests {
     static let features: WasmFeatureSet = [.referenceTypes, .exceptionHandling, .tailCall, .memory64]
@@ -71,9 +71,9 @@ struct ResumableHostCallTests {
 
     struct HostFailure: Error, Equatable {}
 
-    /// A host function that always asks to suspend, with tag 7.
+    /// A host function that always suspends, with the identifier 7.
     static func suspend(_: Fixture, _: [Value]) throws -> [Value] {
-        throw SuspensionRequest(tag: 7)
+        throw SuspensionRequest(id: 7)
     }
 
     static func suspension(
@@ -100,23 +100,23 @@ struct ResumableHostCallTests {
 
     /// The description of the ``ResumableCallError`` that `body` throws, or `nil` when it throws
     /// nothing or something else.
-    static func refusal(
+    static func resumableCallError(
         sourceLocation: SourceLocation = #_sourceLocation, _ body: () throws -> ResumableCall.Status
     ) -> String? {
         do {
             let status = try body()
-            Issue.record("expected a refusal, got \(status)", sourceLocation: sourceLocation)
+            Issue.record("expected a ResumableCallError, got \(status)", sourceLocation: sourceLocation)
         } catch let error as ResumableCallError {
             return error.description
         } catch {
-            Issue.record("expected a refusal, got \(error)", sourceLocation: sourceLocation)
+            Issue.record("expected a ResumableCallError, got \(error)", sourceLocation: sourceLocation)
         }
         return nil
     }
 
     // MARK: Continuing the guest
 
-    /// Nested frames with locals, two suspensions, and host calls that run on both sides of them.
+    /// Nested frames with locals, two suspensions, and host calls before and after each suspension.
     static let nested = """
         (module
           (import "env" "suspend" (func $suspend (param i32) (result i32)))
@@ -141,17 +141,17 @@ struct ResumableHostCallTests {
         """
 
     @Test(arguments: testedThreadingModels)
-    func answersContinueTheGuestWithoutRunningTheHostFunctionAgain(
+    func resultsContinueGuestWithoutRerunningHostFunction(
         threadingModel: EngineConfiguration.ThreadingModel
     ) throws {
-        // The same answers from a synchronous host function give the reference result.
-        var answered = 0
+        // A synchronous host function that returns the same results gives the expected result.
+        var runs = 0
         let synchronous = try Fixture(
             Self.nested, threadingModel: threadingModel,
             hosts: [
                 "suspend": { _, arguments in
-                    answered += 1
-                    return [.i32(answered == 1 ? arguments[0].i32 + 5 : arguments[0].i32 * 2)]
+                    runs += 1
+                    return [.i32(runs == 1 ? arguments[0].i32 + 5 : arguments[0].i32 * 2)]
                 },
                 "effect": { _, _ in [] },
             ])
@@ -162,12 +162,12 @@ struct ResumableHostCallTests {
             Self.nested, threadingModel: threadingModel, hosts: ["suspend": Self.suspend, "effect": { _, _ in [] }])
         let call = try ResumableCall(function: try fixture.export("run"), arguments: [.i32(3)])
         let first = try Self.suspension(try call.resume())
-        #expect(first.reason == .hostCall(tag: 7, arguments: [.i32(30)]))
+        #expect(first.reason == .hostCall(id: 7, arguments: [.i32(30)]))
         #expect(call.suspension?.reason == first.reason)
         #expect(fixture.calls["effect"] == [[.i32(1)]])
-        let second = try Self.suspension(try call.resume(returning: [.i32(35)], answering: first))
-        #expect(second.reason == .hostCall(tag: 7, arguments: [.i32(65)]))
-        #expect(try Self.results(try call.resume(returning: [.i32(130)], answering: second)) == reference)
+        let second = try Self.suspension(try call.resume(returning: [.i32(35)]))
+        #expect(second.reason == .hostCall(id: 7, arguments: [.i32(65)]))
+        #expect(try Self.results(try call.resume(returning: [.i32(130)])) == reference)
         // Every step ran once: two effects, two host calls that suspended, two global writes.
         #expect(fixture.calls["effect"] == [[.i32(1)], [.i32(2)]])
         #expect(fixture.count("suspend") == 2)
@@ -192,30 +192,30 @@ struct ResumableHostCallTests {
         """
 
     @Test(arguments: testedThreadingModels)
-    func hostFunctionsWithoutResultsAndWithSeveral(threadingModel: EngineConfiguration.ThreadingModel) throws {
+    func hostFunctionsWithNoOrManyResults(threadingModel: EngineConfiguration.ThreadingModel) throws {
         let fixture = try Fixture(
             Self.shapes, threadingModel: threadingModel, hosts: ["wait": Self.suspend, "triple": Self.suspend])
         let wait = try ResumableCall(function: try fixture.export("void"))
         let waiting = try Self.suspension(try wait.resume())
-        #expect(waiting.reason == .hostCall(tag: 7, arguments: []))
-        // A host call without results is completed explicitly too. A plain resume neither runs the
-        // host function again nor skips it.
-        #expect(Self.refusal { try wait.resume() } == ResumableCallError.suspendedAtHostCall.description)
+        #expect(waiting.reason == .hostCall(id: 7, arguments: []))
+        // A host call without results also needs `resume(returning: [])`. Calling `resume()`
+        // neither runs the host function again nor skips it.
+        #expect(Self.resumableCallError { try wait.resume() } == ResumableCallError.suspendedAtHostCall.description)
         #expect(wait.suspension?.reason == waiting.reason)
         #expect(fixture.count("wait") == 1)
-        #expect(try Self.results(try wait.resume(returning: [], answering: waiting)) == [.i32(7)])
+        #expect(try Self.results(try wait.resume(returning: [])) == [.i32(7)])
         #expect(fixture.count("wait") == 1)
 
         let triple = try ResumableCall(function: try fixture.export("multi"), arguments: [.i32(4)])
         let tripled = try Self.suspension(try triple.resume())
-        #expect(tripled.reason == .hostCall(tag: 7, arguments: [.i32(4)]))
+        #expect(tripled.reason == .hostCall(id: 7, arguments: [.i32(4)]))
         let results = try Self.results(
-            try triple.resume(returning: [.i32(1), .i64(20), .f64(Double(0.5).bitPattern)], answering: tripled))
+            try triple.resume(returning: [.i32(1), .i64(20), .f64(Double(0.5).bitPattern)]))
         #expect(results == [.f64(Double(21.5).bitPattern)])
     }
 
     @Test(arguments: testedThreadingModels)
-    func aRawHostFunctionSuspendsWithACopyOfItsArguments(threadingModel: EngineConfiguration.ThreadingModel) throws {
+    func rawHostFunctionSuspendsWithCopyOfArguments(threadingModel: EngineConfiguration.ThreadingModel) throws {
         let store = Store(engine: Engine(configuration: EngineConfiguration(threadingModel: threadingModel)))
         var runs = 0
         var imports = Imports()
@@ -225,7 +225,7 @@ struct ResumableHostCallTests {
                 store: store, parameters: [.i32, .i64], results: [.i32],
                 raw: { _, arguments, _ in
                     runs += 1
-                    throw SuspensionRequest(tag: UInt64(arguments[1].i64))
+                    throw SuspensionRequest(id: UInt64(arguments[1].i64))
                 }))
         let wat = """
             (module
@@ -239,9 +239,9 @@ struct ResumableHostCallTests {
         // Another call runs the host function again before the first suspension is read.
         let other = try ResumableCall(function: try #require(instance.exports[function: "f"]), arguments: [.i32(6)])
         _ = try Self.suspension(try other.resume())
-        #expect(suspension.reason == .hostCall(tag: 42, arguments: [.i32(5), .i64(42)]))
-        #expect(call.suspension?.reason == .hostCall(tag: 42, arguments: [.i32(5), .i64(42)]))
-        #expect(try Self.results(try call.resume(returning: [.i32(10)], answering: suspension)) == [.i32(9)])
+        #expect(suspension.reason == .hostCall(id: 42, arguments: [.i32(5), .i64(42)]))
+        #expect(call.suspension?.reason == .hostCall(id: 42, arguments: [.i32(5), .i64(42)]))
+        #expect(try Self.results(try call.resume(returning: [.i32(10)])) == [.i32(9)])
         #expect(runs == 2)
     }
 
@@ -251,7 +251,7 @@ struct ResumableHostCallTests {
     static let references = """
         (module
           (import "env" "pass" (func $pass (param funcref externref) (result externref funcref)))
-          (type $answer (func (result i32)))
+          (type $nullary (func (result i32)))
           (table $t 1 funcref)
           (elem declare func $target)
           (func $target (result i32) (i32.const 42))
@@ -260,11 +260,11 @@ struct ResumableHostCallTests {
             (call $pass (ref.func $target) (local.get 0))
             (local.set $function)
             (table.set $t (i32.const 0) (local.get $function))
-            (call_indirect $t (type $answer) (i32.const 0))))
+            (call_indirect $t (type $nullary) (i32.const 0))))
         """
 
     @Test(arguments: testedThreadingModels)
-    func referencesCrossASuspension(threadingModel: EngineConfiguration.ThreadingModel) throws {
+    func referencesSurviveSuspension(threadingModel: EngineConfiguration.ThreadingModel) throws {
         var suspends = false
         let fixture = try Fixture(
             Self.references, threadingModel: threadingModel,
@@ -274,7 +274,7 @@ struct ResumableHostCallTests {
                     return [.ref(.extern(99)), arguments[0]]
                 }
             ])
-        // A synchronous host function shows what the guest passes and what it makes of the answer.
+        // A synchronous host function shows what the guest passes and does with the results.
         let reference = try fixture.export("f")([.ref(.extern(5))])
         #expect(reference == [.ref(.extern(99)), .i32(42)])
         let passed = try #require(fixture.calls["pass"]?.first)
@@ -288,98 +288,72 @@ struct ResumableHostCallTests {
         let suspension = try Self.suspension(try call.resume())
         // The suspension carries the same references, and the function reference names the same
         // function of this store.
-        #expect(suspension.reason == .hostCall(tag: 7, arguments: [.ref(.function(address)), .ref(.extern(5))]))
+        #expect(suspension.reason == .hostCall(id: 7, arguments: [.ref(.function(address)), .ref(.extern(5))]))
         #expect(
-            Self.refusal { try call.resume(returning: [.ref(.function(address)), .ref(.extern(99))], answering: suspension) }
+            Self.resumableCallError { try call.resume(returning: [.ref(.function(address)), .ref(.extern(99))]) }
                 != nil)
         let results = try Self.results(
-            try call.resume(returning: [.ref(.extern(99)), .ref(.function(address))], answering: suspension))
+            try call.resume(returning: [.ref(.extern(99)), .ref(.function(address))]))
         #expect(results == reference)
         #expect(fixture.count("pass") == 2)
     }
 
-    // MARK: Answers that do not fit
+    // MARK: Rejected results and suspensions
 
     @Test(arguments: testedThreadingModels)
-    func wrongResultsAreRefusedBeforeTheGuestRuns(threadingModel: EngineConfiguration.ThreadingModel) throws {
+    func wrongResultsThrowBeforeGuestRuns(threadingModel: EngineConfiguration.ThreadingModel) throws {
         let fixture = try Fixture(
             Self.shapes, threadingModel: threadingModel, hosts: ["wait": Self.suspend, "triple": Self.suspend])
         let call = try ResumableCall(function: try fixture.export("multi"), arguments: [.i32(4)])
         let suspension = try Self.suspension(try call.resume())
         let mismatch = ResumableCallError.resultTypesMismatch(expected: [.i32, .i64, .f64], got: [.i32(1)])
-        #expect(Self.refusal { try call.resume(returning: [.i32(1)], answering: suspension) } == mismatch.description)
+        #expect(Self.resumableCallError { try call.resume(returning: [.i32(1)]) } == mismatch.description)
         #expect(
-            Self.refusal {
-                try call.resume(returning: [.i32(1), .i32(2), .f64(0), .i32(3)], answering: suspension)
+            Self.resumableCallError {
+                try call.resume(returning: [.i32(1), .i32(2), .f64(0), .i32(3)])
             } != nil)
         #expect(
-            Self.refusal { try call.resume(returning: [.i32(1), .i32(2), .f64(0)], answering: suspension) }
+            Self.resumableCallError { try call.resume(returning: [.i32(1), .i32(2), .f64(0)]) }
                 != nil)
         #expect(call.suspension?.reason == suspension.reason)
         // The same suspension takes the right results afterwards, and the guest sees only them.
         let results = try Self.results(
-            try call.resume(returning: [.i32(1), .i64(2), .f64(Double(3).bitPattern)], answering: suspension))
+            try call.resume(returning: [.i32(1), .i64(2), .f64(Double(3).bitPattern)]))
         #expect(results == [.f64(Double(6).bitPattern)])
         #expect(fixture.count("triple") == 1)
     }
 
     @Test(arguments: testedThreadingModels)
-    func anAnswerForAnotherSuspensionIsRefused(threadingModel: EngineConfiguration.ThreadingModel) throws {
-        let fixture = try Fixture(
-            Self.nested, threadingModel: threadingModel, hosts: ["suspend": Self.suspend, "effect": { _, _ in [] }])
-        let run = try fixture.export("run")
-        let cancelled = try ResumableCall(function: run, arguments: [.i32(3)])
-        let late = try Self.suspension(try cancelled.resume())
-        #expect(throws: HostFailure.self) { try cancelled.resume(throwing: HostFailure()) }
-
-        let call = try ResumableCall(function: run, arguments: [.i32(3)])
-        let first = try Self.suspension(try call.resume())
-        // Both suspensions describe the same host call, and still only the call's own one fits.
-        #expect(late.reason == first.reason)
-        let other = ResumableCallError.otherSuspension.description
-        #expect(Self.refusal { try call.resume(returning: [.i32(35)], answering: late) } == other)
-        #expect(Self.refusal { try call.resume(failing: HostFailure(), answering: late) } == other)
-        #expect(Self.refusal { try cancelled.resume(returning: [.i32(35)], answering: late) } != nil)
-        let second = try Self.suspension(try call.resume(returning: [.i32(35)], answering: first))
-        // An answer to the call's own earlier suspension is refused too.
-        #expect(Self.refusal { try call.resume(returning: [.i32(130)], answering: first) } == other)
-        #expect(try Self.results(try call.resume(returning: [.i32(130)], answering: second)) == [.i32(1198)])
-        #expect(fixture.calls["effect"] == [[.i32(1)], [.i32(1)], [.i32(2)]])
-    }
-
-    @Test(arguments: testedThreadingModels)
-    func onlyACallSuspendedAtAHostCallTakesAnAnswer(threadingModel: EngineConfiguration.ThreadingModel) throws {
+    func onlyCallSuspendedAtHostCallTakesResults(threadingModel: EngineConfiguration.ThreadingModel) throws {
         let fixture = try Fixture(
             Self.nested, threadingModel: threadingModel, fuel: 0,
             hosts: ["suspend": Self.suspend, "effect": { _, _ in [] }])
         let call = try ResumableCall(function: try fixture.export("run"), arguments: [.i32(3)])
         let notAtHostCall = ResumableCallError.notSuspendedAtHostCall.description
-        let elsewhere = try ResumableCall(function: try fixture.export("run"), arguments: [.i32(4)])
-        fixture.store.fuel = Fuel(remaining: 1 << 20)
-        let hostSuspension = try Self.suspension(try elsewhere.resume())
-        fixture.store.fuel = Fuel(remaining: 0)
         // Not started yet.
-        #expect(Self.refusal { try call.resume(returning: [.i32(1)], answering: hostSuspension) } == notAtHostCall)
+        #expect(Self.resumableCallError { try call.resume(returning: [.i32(1)]) } == notAtHostCall)
         // Suspended for fuel.
         let outOfFuel = try Self.suspension(try call.resume())
         guard case .outOfFuel = outOfFuel.reason else {
             Issue.record("expected an out-of-fuel suspension, got \(outOfFuel.reason)")
             return
         }
-        #expect(Self.refusal { try call.resume(returning: [], answering: outOfFuel) } == notAtHostCall)
-        #expect(Self.refusal { try call.resume(failing: HostFailure(), answering: outOfFuel) } == notAtHostCall)
+        #expect(Self.resumableCallError { try call.resume(returning: []) } == notAtHostCall)
+        #expect(Self.resumableCallError { try call.resume(failing: HostFailure()) } == notAtHostCall)
         #expect(call.suspension?.reason == outOfFuel.reason)
         fixture.store.fuel = Fuel(remaining: 1 << 20)
         let suspension = try Self.suspension(try call.resume())
-        #expect(suspension.reason == .hostCall(tag: 7, arguments: [.i32(30)]))
-        _ = try Self.suspension(try call.resume(returning: [.i32(35)], answering: suspension))
+        #expect(suspension.reason == .hostCall(id: 7, arguments: [.i32(30)]))
+        _ = try Self.suspension(try call.resume(returning: [.i32(35)]))
         #expect(throws: Trap.self) { try call.resume(throwing: Trap(.message(.init("cancelled")))) }
-        #expect(fixture.calls["effect"] == [[.i32(1)], [.i32(1)], [.i32(2)]])
+        // Finished.
+        #expect(Self.resumableCallError { try call.resume(returning: [.i32(1)]) } == ResumableCallError.finished.description)
+        #expect(fixture.calls["effect"] == [[.i32(1)], [.i32(2)]])
     }
 
     // MARK: Two calls of one store
 
-    /// `run` suspends with its argument as the tag and then records the answer.
+    /// `run` suspends with its argument as the identifier and then passes the result to `after`.
     static let twoCalls = """
         (module
           (import "env" "suspend" (func $suspend (param i32) (result i32)))
@@ -398,7 +372,7 @@ struct ResumableHostCallTests {
         """
 
     static func suspendWithArgument(_: Fixture, _ arguments: [Value]) throws -> [Value] {
-        throw SuspensionRequest(tag: UInt64(arguments[0].i32))
+        throw SuspensionRequest(id: UInt64(arguments[0].i32))
     }
 
     @Test(arguments: testedThreadingModels)
@@ -412,59 +386,31 @@ struct ResumableHostCallTests {
         let b = try ResumableCall(function: try fixture.export("run"), arguments: [.i32(2)])
         let aSuspension = try Self.suspension(try a.resume())
         let bSuspension = try Self.suspension(try b.resume())
-        #expect(aSuspension.reason == .hostCall(tag: 1, arguments: [.i32(1)]))
-        #expect(bSuspension.reason == .hostCall(tag: 2, arguments: [.i32(2)]))
+        #expect(aSuspension.reason == .hostCall(id: 1, arguments: [.i32(1)]))
+        #expect(bSuspension.reason == .hostCall(id: 2, arguments: [.i32(2)]))
 
-        // Answers for the other call are refused, and both calls stay suspended.
-        let other = ResumableCallError.otherSuspension.description
-        #expect(Self.refusal { try a.resume(returning: [.i32(10)], answering: bSuspension) } == other)
-        #expect(Self.refusal { try b.resume(failing: HostFailure(), answering: aSuspension) } == other)
-        #expect(Self.refusal { try a.resume(returning: [.i64(10)], answering: aSuspension) } != nil)
+        // Wrong results leave both calls suspended.
+        #expect(Self.resumableCallError { try a.resume(returning: [.i64(10)]) } != nil)
         #expect(fixture.count("after") == 0)
 
-        // Each finishes with its own answer, the later one first.
-        #expect(try Self.results(try b.resume(returning: [.i32(20)], answering: bSuspension)) == [.i32(22)])
-        #expect(try Self.results(try a.resume(returning: [.i32(10)], answering: aSuspension)) == [.i32(11)])
+        // Each call finishes with its own results, the later one first.
+        #expect(try Self.results(try b.resume(returning: [.i32(20)])) == [.i32(22)])
+        #expect(try Self.results(try a.resume(returning: [.i32(10)])) == [.i32(11)])
         #expect(fixture.calls["after"] == [[.i32(20)], [.i32(10)]])
         #expect(fixture.store.isSuspendable == false)
     }
 
-    @Test(arguments: testedThreadingModels)
-    func anAnswerFromAnotherStoreIsRefused(threadingModel: EngineConfiguration.ThreadingModel) throws {
-        let hosts: [String: (Fixture, [Value]) throws -> [Value]] = [
-            "suspend": Self.suspendWithArgument, "after": { _, _ in [] }, "drive": { _, _ in throw HostFailure() },
-        ]
-        let left = try Fixture(Self.twoCalls, threadingModel: threadingModel, hosts: hosts)
-        let right = try Fixture(Self.twoCalls, threadingModel: threadingModel, hosts: hosts)
-        let a = try ResumableCall(function: try left.export("run"), arguments: [.i32(1)])
-        let b = try ResumableCall(function: try right.export("run"), arguments: [.i32(1)])
-        let aSuspension = try Self.suspension(try a.resume())
-        let bSuspension = try Self.suspension(try b.resume())
-        // The two suspensions describe equal host calls, so only their identity tells them apart.
-        #expect(aSuspension.reason == bSuspension.reason)
-        let other = ResumableCallError.otherSuspension.description
-        #expect(Self.refusal { try a.resume(returning: [.i32(10)], answering: bSuspension) } == other)
-        #expect(Self.refusal { try b.resume(failing: HostFailure(), answering: aSuspension) } == other)
-        #expect(left.count("after") + right.count("after") == 0)
-        #expect(try Self.results(try b.resume(returning: [.i32(20)], answering: bSuspension)) == [.i32(21)])
-        #expect(try Self.results(try a.resume(returning: [.i32(10)], answering: aSuspension)) == [.i32(11)])
-        #expect(left.calls["after"] == [[.i32(10)]])
-        #expect(right.calls["after"] == [[.i32(20)]])
-    }
-
-    /// Calls that a host function of a running call finishes or refuses.
+    /// The suspended calls that `drive` resumes, and what it saw.
     final class Pending {
         var first: ResumableCall?
-        var firstSuspension: Suspension?
         var second: ResumableCall?
-        var secondSuspension: Suspension?
-        var refused: String?
+        var error: String?
         var firstResults: [Value]?
         var secondTrapped = false
     }
 
     @Test(arguments: testedThreadingModels)
-    func aHostFunctionFinishesOtherCallsAndItsOwnCallStillSuspends(
+    func hostFunctionFinishesOtherCallsBeforeItsOwnCallSuspends(
         threadingModel: EngineConfiguration.ThreadingModel
     ) throws {
         let pending = Pending()
@@ -474,17 +420,16 @@ struct ResumableHostCallTests {
                 "suspend": Self.suspendWithArgument, "after": { _, _ in [] },
                 "drive": { fixture, _ in
                     let first = try #require(pending.first)
-                    let firstSuspension = try #require(pending.firstSuspension)
                     let second = try #require(pending.second)
-                    let secondSuspension = try #require(pending.secondSuspension)
-                    // A refusal leaves the other call suspended and this one running.
-                    pending.refused = Self.refusal { try first.resume(returning: [], answering: firstSuspension) }
+                    // Wrong results for `first` throw. `first` stays suspended, and this call keeps
+                    // running.
+                    pending.error = Self.resumableCallError { try first.resume(returning: []) }
                     #expect(fixture.store.isSuspendable)
                     pending.firstResults = try Self.results(
-                        try first.resume(returning: [.i32(100)], answering: firstSuspension))
+                        try first.resume(returning: [.i32(100)]))
                     #expect(fixture.store.isSuspendable)
                     do {
-                        _ = try second.resume(returning: [.i32(0)], answering: secondSuspension)
+                        _ = try second.resume(returning: [.i32(0)])
                     } catch let trap as Trap {
                         if case .unreachable = trap.reason { pending.secondTrapped = true }
                     }
@@ -493,17 +438,17 @@ struct ResumableHostCallTests {
                 },
             ])
         pending.first = try ResumableCall(function: try fixture.export("run"), arguments: [.i32(5)])
-        pending.firstSuspension = try Self.suspension(try #require(pending.first).resume())
+        _ = try Self.suspension(try #require(pending.first).resume())
         pending.second = try ResumableCall(function: try fixture.export("trapAfter"), arguments: [.i32(6)])
-        pending.secondSuspension = try Self.suspension(try #require(pending.second).resume())
+        _ = try Self.suspension(try #require(pending.second).resume())
 
         let outer = try ResumableCall(function: try fixture.export("outer"))
         let suspension = try Self.suspension(try outer.resume())
-        #expect(suspension.reason == .hostCall(tag: 9, arguments: [.i32(9)]))
-        #expect(pending.refused != nil)
+        #expect(suspension.reason == .hostCall(id: 9, arguments: [.i32(9)]))
+        #expect(pending.error != nil)
         #expect(pending.firstResults == [.i32(105)])
         #expect(pending.secondTrapped)
-        #expect(try Self.results(try outer.resume(returning: [.i32(1000)], answering: suspension)) == [.i32(1001)])
+        #expect(try Self.results(try outer.resume(returning: [.i32(1000)])) == [.i32(1001)])
         #expect(fixture.calls["after"] == [[.i32(100)]])
         #expect(fixture.store.isSuspendable == false)
     }
@@ -511,7 +456,7 @@ struct ResumableHostCallTests {
     // MARK: Calls into the host
 
     /// The host's parameter area holds three parameters and two results, and the tail callers'
-    /// frames are smaller and larger than it, so the frame moves both ways before the suspension.
+    /// frames are smaller and larger than it. The frame moves down in `small` and up in `large`.
     /// ``ResumableHostCallTailTests`` covers arguments that reach the tail caller's saved slots.
     static let tailCalls = """
         (module
@@ -532,20 +477,20 @@ struct ResumableHostCallTests {
         """
 
     @Test(arguments: testedThreadingModels)
-    func aTailCallToTheHostResumesInTheMovedFrame(threadingModel: EngineConfiguration.ThreadingModel) throws {
+    func tailCallToHostResumesInMovedFrame(threadingModel: EngineConfiguration.ThreadingModel) throws {
         let fixture = try Fixture(
             Self.tailCalls, threadingModel: threadingModel, hosts: ["suspend": Self.suspend])
         let small = try ResumableCall(function: try fixture.export("small"), arguments: [.i32(5)])
         let smallSuspension = try Self.suspension(try small.resume())
-        #expect(smallSuspension.reason == .hostCall(tag: 7, arguments: [.i32(5), .i64(5), .i32(9)]))
+        #expect(smallSuspension.reason == .hostCall(id: 7, arguments: [.i32(5), .i64(5), .i32(9)]))
         #expect(
-            try Self.results(try small.resume(returning: [.i64(1000), .i32(7)], answering: smallSuspension))
+            try Self.results(try small.resume(returning: [.i64(1000), .i32(7)]))
                 == [.i64(1007)])
         let large = try ResumableCall(function: try fixture.export("large"), arguments: [.i32(5)])
         let largeSuspension = try Self.suspension(try large.resume())
-        #expect(largeSuspension.reason == .hostCall(tag: 7, arguments: [.i32(5), .i64(8), .i32(8)]))
+        #expect(largeSuspension.reason == .hostCall(id: 7, arguments: [.i32(5), .i64(8), .i32(8)]))
         #expect(
-            try Self.results(try large.resume(returning: [.i64(2000), .i32(30)], answering: largeSuspension))
+            try Self.results(try large.resume(returning: [.i64(2000), .i32(30)]))
                 == [.i64(2030)])
     }
 
@@ -564,15 +509,15 @@ struct ResumableHostCallTests {
         """
 
     @Test(arguments: testedThreadingModels)
-    func indirectCallsToTheHostSuspend(threadingModel: EngineConfiguration.ThreadingModel) throws {
+    func indirectCallsToHostSuspend(threadingModel: EngineConfiguration.ThreadingModel) throws {
         let fixture = try Fixture(Self.indirectCalls, threadingModel: threadingModel, hosts: ["suspend": Self.suspend])
         let call = try ResumableCall(function: try fixture.export("indirect"), arguments: [.i32(10)])
         let first = try Self.suspension(try call.resume())
-        #expect(first.reason == .hostCall(tag: 7, arguments: [.i32(10)]))
+        #expect(first.reason == .hostCall(id: 7, arguments: [.i32(10)]))
         // The second suspension comes from a tail call through the table.
-        let second = try Self.suspension(try call.resume(returning: [.i32(100)], answering: first))
-        #expect(second.reason == .hostCall(tag: 7, arguments: [.i32(11)]))
-        #expect(try Self.results(try call.resume(returning: [.i32(1000)], answering: second)) == [.i32(1100)])
+        let second = try Self.suspension(try call.resume(returning: [.i32(100)]))
+        #expect(second.reason == .hostCall(id: 7, arguments: [.i32(11)]))
+        #expect(try Self.results(try call.resume(returning: [.i32(1000)])) == [.i32(1100)])
         #expect(fixture.count("suspend") == 2)
     }
 
@@ -615,17 +560,17 @@ struct ResumableHostCallTests {
     }
 
     @Test(arguments: testedThreadingModels)
-    func exceptionHandlersSurviveAHostCallSuspension(threadingModel: EngineConfiguration.ThreadingModel) throws {
+    func exceptionHandlersSurviveHostCallSuspension(threadingModel: EngineConfiguration.ThreadingModel) throws {
         let fixture = try Fixture(
             Self.failures, threadingModel: threadingModel, hosts: ["suspend": Self.suspend, "effect": { _, _ in [] }])
         let (exception, _) = try Self.exceptionAndTrap(fixture)
         // The handler belongs to the caller's frame, and the call suspends in the callee.
         let caller = try ResumableCall(function: try fixture.export("caller"))
-        let suspension = try Self.suspension(try caller.resume())
-        #expect(try Self.results(try caller.resume(returning: [.i32(5)], answering: suspension)) == [.i32(15)])
+        _ = try Self.suspension(try caller.resume())
+        #expect(try Self.results(try caller.resume(returning: [.i32(5)])) == [.i32(15)])
         let delivered = try ResumableCall(function: try fixture.export("caller"))
-        let next = try Self.suspension(try delivered.resume())
-        #expect(try Self.results(try delivered.resume(failing: exception, answering: next)) == [.i32(77)])
+        _ = try Self.suspension(try delivered.resume())
+        #expect(try Self.results(try delivered.resume(failing: exception)) == [.i32(77)])
     }
 
     /// The suspended call sits in a `try_table` with a tagged clause before a `catch_all`.
@@ -654,7 +599,7 @@ struct ResumableHostCallTests {
         """
 
     @Test(arguments: testedThreadingModels)
-    func aFailedHostCallFollowsTheCatchClauses(threadingModel: EngineConfiguration.ThreadingModel) throws {
+    func failedHostCallFollowsCatchClauses(threadingModel: EngineConfiguration.ThreadingModel) throws {
         let fixture = try Fixture(Self.catchClauses, threadingModel: threadingModel, hosts: ["suspend": Self.suspend])
         var exception: WasmKitException?
         do { _ = try fixture.export("raise")([.i32(77)]) } catch let error as WasmKitException { exception = error }
@@ -662,19 +607,19 @@ struct ResumableHostCallTests {
 
         // The clauses are tried in source order, so the tagged clause catches before catch_all.
         let ordered = try ResumableCall(function: try fixture.export("ordered"))
-        let suspension = try Self.suspension(try ordered.resume())
-        #expect(try Self.results(try ordered.resume(failing: raised, answering: suspension)) == [.i32(77)])
+        _ = try Self.suspension(try ordered.resume())
+        #expect(try Self.results(try ordered.resume(failing: raised)) == [.i32(77)])
 
         // A catch leaves the whole try_table, so its catch_all no longer handles a later failure.
         let exited = try ResumableCall(function: try fixture.export("exited"))
-        let first = try Self.suspension(try exited.resume())
-        let second = try Self.suspension(try exited.resume(failing: raised, answering: first))
-        #expect(throws: WasmKitException.self) { try exited.resume(failing: raised, answering: second) }
+        _ = try Self.suspension(try exited.resume())
+        _ = try Self.suspension(try exited.resume(failing: raised))
+        #expect(throws: WasmKitException.self) { try exited.resume(failing: raised) }
         #expect(exited.isFinished)
     }
 
     @Test(arguments: testedThreadingModels)
-    func failingThrowsWhatASynchronousHostFunctionWouldThrow(
+    func failingThrowsLikeSynchronousHostFunction(
         threadingModel: EngineConfiguration.ThreadingModel
     ) throws {
         var synchronousFailure: (any Error)?
@@ -692,20 +637,20 @@ struct ResumableHostCallTests {
         // A handler in the suspended frame catches the exception, and the addition after the call
         // never runs.
         let guarded = try ResumableCall(function: try fixture.export("guarded"))
-        let guardedSuspension = try Self.suspension(try guarded.resume())
-        #expect(try Self.results(try guarded.resume(failing: exception, answering: guardedSuspension)) == [.i32(77)])
+        _ = try Self.suspension(try guarded.resume())
+        #expect(try Self.results(try guarded.resume(failing: exception)) == [.i32(77)])
 
         // Without a handler, the exception finishes the call.
         let unguarded = try ResumableCall(function: try fixture.export("unguarded"))
-        let unguardedSuspension = try Self.suspension(try unguarded.resume())
-        #expect(throws: WasmKitException.self) { try unguarded.resume(failing: exception, answering: unguardedSuspension) }
+        _ = try Self.suspension(try unguarded.resume())
+        #expect(throws: WasmKitException.self) { try unguarded.resume(failing: exception) }
         #expect(unguarded.isFinished)
 
         // A trap finishes the call with the backtrace a synchronous host function's trap gets.
         let trapped = try ResumableCall(function: try fixture.export("deep"))
-        let trappedSuspension = try Self.suspension(try trapped.resume())
+        _ = try Self.suspension(try trapped.resume())
         var resumed: Trap?
-        do { _ = try trapped.resume(failing: trap, answering: trappedSuspension) } catch let error as Trap { resumed = error }
+        do { _ = try trapped.resume(failing: trap) } catch let error as Trap { resumed = error }
         synchronousFailure = trap
         var synchronous: Trap?
         do { _ = try fixture.export("deep")() } catch let error as Trap { synchronous = error }
@@ -714,23 +659,24 @@ struct ResumableHostCallTests {
         #expect(resumedBacktrace.trapSite == synchronousBacktrace.trapSite)
         #expect(resumedBacktrace.symbols.count == 2)
         #expect(resumedBacktrace.symbols.map(\.name) == synchronousBacktrace.symbols.map(\.name))
-        // The root frame returns to code that a plain call and a resumable call keep apart.
+        // Only the outermost frame differs, because the called function returns to different code
+        // in `invoke` and in a resumable call.
         #expect(
             resumedBacktrace.symbols.dropLast().map(\.address) == synchronousBacktrace.symbols.dropLast().map(\.address))
         #expect(trapped.isFinished)
 
-        // Any other error finishes the call as it is.
+        // Any other error finishes the call and comes back unchanged.
         synchronousFailure = nil
         let failed = try ResumableCall(function: try fixture.export("unguarded"))
-        let failedSuspension = try Self.suspension(try failed.resume())
-        #expect(throws: HostFailure.self) { try failed.resume(failing: HostFailure(), answering: failedSuspension) }
+        _ = try Self.suspension(try failed.resume())
+        #expect(throws: HostFailure.self) { try failed.resume(failing: HostFailure()) }
         #expect(failed.isFinished)
         // The guest never continued past any of the host calls it was suspended in.
         #expect(fixture.count("effect") == 0)
     }
 
     @Test(arguments: testedThreadingModels)
-    func cancellingKeepsTheGuestFromCatchingAnything(threadingModel: EngineConfiguration.ThreadingModel) throws {
+    func cancellingKeepsGuestFromCatchingAnything(threadingModel: EngineConfiguration.ThreadingModel) throws {
         var synchronousFailure: (any Error)?
         let fixture = try Fixture(
             Self.failures, threadingModel: threadingModel,
@@ -746,7 +692,7 @@ struct ResumableHostCallTests {
             function: try fixture.export("guarded"), on: ExecutionStack(engine: fixture.store.engine))
         let suspension = try Self.suspension(try call.resume())
         #expect(throws: ResumableCallError.self) { try call.resume(throwing: exception) }
-        #expect(throws: ResumableCallError.self) { try call.resume(throwing: SuspensionRequest(tag: 1)) }
+        #expect(throws: ResumableCallError.self) { try call.resume(throwing: SuspensionRequest(id: 1)) }
         #expect(call.suspension?.reason == suspension.reason)
 
         var cancelled: Trap?
@@ -756,7 +702,7 @@ struct ResumableHostCallTests {
         do { _ = try fixture.export("guarded")() } catch let error as Trap { synchronous = error }
         #expect(try #require(cancelled?.backtrace).trapSite == (try #require(synchronous?.backtrace)).trapSite)
         #expect(call.isFinished)
-        #expect(Self.refusal { try call.resume(returning: [.i32(1)], answering: suspension) } != nil)
+        #expect(Self.resumableCallError { try call.resume(returning: [.i32(1)]) } != nil)
 
         // The finished call keeps its stack until it is taken, and the stack runs another call.
         guard let stack = call.takeStack() else {
@@ -765,8 +711,8 @@ struct ResumableHostCallTests {
         }
         synchronousFailure = nil
         let next = try ResumableCall(function: try fixture.export("unguarded"), on: stack)
-        let nextSuspension = try Self.suspension(try next.resume())
-        #expect(try Self.results(try next.resume(returning: [.i32(3)], answering: nextSuspension)) == [.i32(3)])
+        _ = try Self.suspension(try next.resume())
+        #expect(try Self.results(try next.resume(returning: [.i32(3)])) == [.i32(3)])
         #expect(fixture.count("effect") == 1)
     }
 
@@ -776,7 +722,7 @@ struct ResumableHostCallTests {
     }
 
     @Test(arguments: testedThreadingModels)
-    func aFinishedCallHandsBackItsStackHoweverItEnded(threadingModel: EngineConfiguration.ThreadingModel) throws {
+    func finishedCallReturnsStackHoweverItEnded(threadingModel: EngineConfiguration.ThreadingModel) throws {
         let fixture = try Fixture(
             Self.failures, threadingModel: threadingModel, hosts: ["suspend": Self.suspend, "effect": { _, _ in [] }])
         let (exception, trap) = try Self.exceptionAndTrap(fixture)
@@ -785,17 +731,17 @@ struct ResumableHostCallTests {
         var stack = ExecutionStack(engine: fixture.store.engine)
         for ending in Ending.allCases {
             let call = try ResumableCall(function: unguarded, on: stack)
-            let suspension = try Self.suspension(try call.resume())
+            _ = try Self.suspension(try call.resume())
             do {
                 switch ending {
                 case .returned:
-                    #expect(try Self.results(try call.resume(returning: [.i32(3)], answering: suspension)) == [.i32(3)])
+                    #expect(try Self.results(try call.resume(returning: [.i32(3)])) == [.i32(3)])
                 case .trapped:
-                    #expect(throws: Trap.self) { try call.resume(failing: trap, answering: suspension) }
+                    #expect(throws: Trap.self) { try call.resume(failing: trap) }
                 case .raised:
-                    #expect(throws: WasmKitException.self) { try call.resume(failing: exception, answering: suspension) }
+                    #expect(throws: WasmKitException.self) { try call.resume(failing: exception) }
                 case .failed:
-                    #expect(throws: HostFailure.self) { try call.resume(failing: HostFailure(), answering: suspension) }
+                    #expect(throws: HostFailure.self) { try call.resume(failing: HostFailure()) }
                 case .cancelled:
                     #expect(throws: HostFailure.self) { try call.resume(throwing: HostFailure()) }
                 }
@@ -809,24 +755,24 @@ struct ResumableHostCallTests {
             #expect(!tookAgain)
             stack = next
         }
-        // Only the answered call went on past its host call.
+        // Only the call resumed with results went on past its host call.
         #expect(fixture.count("effect") == 1)
         #expect(fixture.count("suspend") == Ending.allCases.count)
     }
 
     @Test(arguments: testedThreadingModels)
-    func aSuspensionRequestCannotCompleteOrCancelACall(threadingModel: EngineConfiguration.ThreadingModel) throws {
+    func suspensionRequestCannotCompleteOrCancelCall(threadingModel: EngineConfiguration.ThreadingModel) throws {
         let fixture = try Fixture(
             Self.failures, threadingModel: threadingModel, hosts: ["suspend": Self.suspend, "effect": { _, _ in [] }])
         let call = try ResumableCall(function: try fixture.export("unguarded"))
         let suspension = try Self.suspension(try call.resume())
         #expect(
-            Self.refusal { try call.resume(failing: SuspensionRequest(tag: 2), answering: suspension) }
+            Self.resumableCallError { try call.resume(failing: SuspensionRequest(id: 2)) }
                 == ResumableCallError.requestNotThrowable.description)
-        #expect(throws: ResumableCallError.self) { try call.resume(throwing: SuspensionRequest(tag: 2)) }
+        #expect(throws: ResumableCallError.self) { try call.resume(throwing: SuspensionRequest(id: 2)) }
         #expect(call.suspension?.reason == suspension.reason)
         #expect(fixture.count("suspend") == 1)
-        #expect(try Self.results(try call.resume(returning: [.i32(4)], answering: suspension)) == [.i32(4)])
+        #expect(try Self.results(try call.resume(returning: [.i32(4)])) == [.i32(4)])
     }
 
     // MARK: Calls that cannot be suspended
@@ -866,36 +812,36 @@ struct ResumableHostCallTests {
     }
 
     @Test(arguments: testedThreadingModels)
-    func aPlainCallTrapsInsteadOfSuspending(threadingModel: EngineConfiguration.ThreadingModel) throws {
+    func invokeTrapsInsteadOfSuspending(threadingModel: EngineConfiguration.ThreadingModel) throws {
         var nested: (any Error)?
         let fixture = try Fixture(
             Self.reentry, threadingModel: threadingModel,
             hosts: [
                 "suspend": Self.suspend,
                 "reenter": { fixture, arguments in
-                    // A plain call cannot be suspended, because this host function's native
-                    // frames would have to be kept. Its trap does not end the outer call.
+                    // `invoke` cannot suspend, because a suspension cannot save the native frames
+                    // of this host function. The trap from `invoke` does not end the outer call.
                     do { _ = try fixture.export("inner")() } catch { nested = error }
                     #expect(fixture.store.isSuspendable)
-                    throw SuspensionRequest(tag: UInt64(arguments[0].i32))
+                    throw SuspensionRequest(id: UInt64(arguments[0].i32))
                 },
             ])
-        var plain: (any Error)?
-        do { _ = try fixture.export("inner")() } catch { plain = error }
-        Self.expectSuspensionUnavailable(plain)
-        #expect((plain as? Trap)?.backtrace?.symbols.isEmpty == false)
+        var direct: (any Error)?
+        do { _ = try fixture.export("inner")() } catch { direct = error }
+        Self.expectSuspensionUnavailable(direct)
+        #expect((direct as? Trap)?.backtrace?.symbols.isEmpty == false)
 
         let call = try ResumableCall(function: try fixture.export("outer"), arguments: [.i32(21)])
         let suspension = try Self.suspension(try call.resume())
         Self.expectSuspensionUnavailable(nested)
-        #expect(suspension.reason == .hostCall(tag: 21, arguments: [.i32(21)]))
-        #expect(try Self.results(try call.resume(returning: [.i32(8)], answering: suspension)) == [.i32(8)])
+        #expect(suspension.reason == .hostCall(id: 21, arguments: [.i32(21)]))
+        #expect(try Self.results(try call.resume(returning: [.i32(8)])) == [.i32(8)])
         #expect(fixture.count("suspend") == 2)
         #expect(fixture.store.isSuspendable == false)
     }
 
     @Test(arguments: testedThreadingModels)
-    func aHostFunctionCalledWithoutAGuestCannotSuspend(threadingModel: EngineConfiguration.ThreadingModel) throws {
+    func hostFunctionCalledWithoutGuestCannotSuspend(threadingModel: EngineConfiguration.ThreadingModel) throws {
         var inner: [String: any Error] = [:]
         var pausing: Function?
         let fixture = try Fixture(
@@ -905,7 +851,7 @@ struct ResumableHostCallTests {
                 "reenter": { fixture, arguments in
                     let pausing = try #require(pausing)
                     if arguments[0] == .i32(1) {
-                        // Rethrown as it comes, which must not suspend the outer call.
+                        // The trap propagates unchanged and does not suspend the outer call.
                         return try pausing()
                     }
                     do { _ = try pausing() } catch { inner["invoke"] = error }
@@ -918,7 +864,7 @@ struct ResumableHostCallTests {
                 },
             ])
         pausing = Function(store: fixture.store, parameters: [], results: [.i32]) { _, _ in
-            throw SuspensionRequest(tag: 3)
+            throw SuspensionRequest(id: 3)
         }
         let host = try #require(pausing)
         // From the embedder, with and without a stack of its own.
@@ -952,7 +898,7 @@ struct ResumableHostCallTests {
     }
 
     @Test(arguments: testedThreadingModels)
-    func cancellingFromAHostFunctionDoesNotSuspendItsCaller(threadingModel: EngineConfiguration.ThreadingModel) throws {
+    func cancellingFromHostFunctionDoesNotSuspendCaller(threadingModel: EngineConfiguration.ThreadingModel) throws {
         var inner: ResumableCall?
         let fixture = try Fixture(
             Self.reentry, threadingModel: threadingModel,
@@ -960,12 +906,13 @@ struct ResumableHostCallTests {
                 "suspend": Self.suspend,
                 "reenter": { fixture, arguments in
                     let call = try #require(inner)
-                    // Rethrown as it comes. A request passed on here would suspend the outer call.
+                    // `resume(throwing:)` rejects the request, and its ResumableCallError propagates
+                    // unchanged. A request passed on here would suspend the outer call.
                     if arguments[0] == .i32(1) {
-                        try call.resume(throwing: SuspensionRequest(tag: 4))
+                        try call.resume(throwing: SuspensionRequest(id: 4))
                     }
-                    let suspension = try #require(call.suspension)
-                    return try Self.results(try call.resume(failing: SuspensionRequest(tag: 4), answering: suspension))
+                    try #require(call.suspension != nil)
+                    return try Self.results(try call.resume(failing: SuspensionRequest(id: 4)))
                 },
             ])
         inner = try ResumableCall(function: try fixture.export("inner"))
@@ -982,7 +929,7 @@ struct ResumableHostCallTests {
     // MARK: Nesting
 
     @Test(arguments: testedThreadingModels)
-    func aResumableCallInsideAHostFunctionSuspendsOnItsOwn(threadingModel: EngineConfiguration.ThreadingModel) throws {
+    func resumableCallInsideHostFunctionSuspendsOnItsOwn(threadingModel: EngineConfiguration.ThreadingModel) throws {
         var innerSuspensions = 0
         let fixture = try Fixture(
             Self.reentry, threadingModel: threadingModel,
@@ -992,22 +939,22 @@ struct ResumableHostCallTests {
                     // A synchronous call into the guest finishes before anything suspends.
                     let doubled = try fixture.export("double")([arguments[0]])
                     let call = try ResumableCall(function: try fixture.export("inner"))
-                    let suspension = try Self.suspension(try call.resume())
+                    _ = try Self.suspension(try call.resume())
                     innerSuspensions += 1
                     #expect(fixture.store.isSuspendable == (arguments[0] != .i32(.max)))
-                    let results = try Self.results(try call.resume(returning: doubled, answering: suspension))
-                    // Then this host function's own call suspends, unless a plain call reached it.
-                    throw SuspensionRequest(tag: UInt64(results[0].i32))
+                    let results = try Self.results(try call.resume(returning: doubled))
+                    // Then the host function suspends its caller. Inside `invoke` this traps.
+                    throw SuspensionRequest(id: UInt64(results[0].i32))
                 },
             ])
         let outer = try ResumableCall(function: try fixture.export("outer"), arguments: [.i32(21)])
         let suspension = try Self.suspension(try outer.resume())
-        #expect(suspension.reason == .hostCall(tag: 42, arguments: [.i32(21)]))
-        #expect(try Self.results(try outer.resume(returning: [.i32(7)], answering: suspension)) == [.i32(7)])
+        #expect(suspension.reason == .hostCall(id: 42, arguments: [.i32(21)]))
+        #expect(try Self.results(try outer.resume(returning: [.i32(7)])) == [.i32(7)])
         #expect(innerSuspensions == 1)
 
-        // Reached through a plain call, the host function still suspends its own resumable call,
-        // and its request to suspend the plain call traps.
+        // Called through `invoke`, the host function still suspends its own resumable call, but
+        // its suspension request traps.
         var error: (any Error)?
         do { _ = try fixture.export("outer")([.i32(.max)]) } catch let caught { error = caught }
         Self.expectSuspensionUnavailable(error)
@@ -1016,68 +963,73 @@ struct ResumableHostCallTests {
     }
 
     @Test(arguments: testedThreadingModels)
-    func aCallCannotBeAnsweredWhileItRuns(threadingModel: EngineConfiguration.ThreadingModel) throws {
+    func runningCallCannotBeResumed(threadingModel: EngineConfiguration.ThreadingModel) throws {
         var call: ResumableCall?
-        var first: Suspension?
-        var refusals: [String?] = []
+        var suspended = false
+        var errors: [String?] = []
         let fixture = try Fixture(
             #"(module (import "env" "h" (func $h (result i32))) (func (export "f") (result i32) (i32.add (call $h) (call $h))))"#,
             threadingModel: threadingModel,
             hosts: [
                 "h": { _, _ in
                     let running = try #require(call)
-                    guard let first else { throw SuspensionRequest(tag: 1) }
-                    // The second host call runs inside the answer to the first suspension.
+                    guard suspended else { throw SuspensionRequest(id: 1) }
+                    // The second host call runs while the call resumes from the first suspension.
                     #expect(running.suspension == nil)
-                    refusals.append(Self.refusal { try running.resume(returning: [.i32(1)], answering: first) })
-                    refusals.append(Self.refusal { try running.resume() })
+                    errors.append(Self.resumableCallError { try running.resume(returning: [.i32(1)]) })
+                    errors.append(Self.resumableCallError { try running.resume() })
                     return [.i32(2)]
                 }
             ])
         call = try ResumableCall(function: try fixture.export("f"))
-        let suspension = try Self.suspension(try #require(call).resume())
-        first = suspension
-        #expect(try Self.results(try #require(call).resume(returning: [.i32(40)], answering: suspension)) == [.i32(42)])
+        _ = try Self.suspension(try #require(call).resume())
+        suspended = true
+        #expect(try Self.results(try #require(call).resume(returning: [.i32(40)])) == [.i32(42)])
         let running = ResumableCallError.alreadyRunning.description
-        #expect(refusals == [running, running])
+        #expect(errors == [running, running])
     }
 
     @Test(arguments: testedThreadingModels)
-    func refusedAnswersKeepTheCallAndDroppingItReleasesIt(threadingModel: EngineConfiguration.ThreadingModel) throws {
+    func rejectedResumesKeepCallSuspended(threadingModel: EngineConfiguration.ThreadingModel) throws {
         let fixture = try Fixture(
             Self.nested, threadingModel: threadingModel, hosts: ["suspend": Self.suspend, "effect": { _, _ in [] }])
-        let run = try fixture.export("run")
-        let other = try ResumableCall(function: run, arguments: [.i32(4)])
-        let otherSuspension = try Self.suspension(try other.resume())
+        let call = try ResumableCall(function: try fixture.export("run"), arguments: [.i32(3)])
+        let suspension = try Self.suspension(try call.resume())
+        #expect(Self.resumableCallError { try call.resume(returning: []) } != nil)
+        #expect(Self.resumableCallError { try call.resume(returning: [.i64(1)]) } != nil)
+        #expect(Self.resumableCallError { try call.resume(returning: [.i32(1), .i32(2)]) } != nil)
+        #expect(Self.resumableCallError { try call.resume() } != nil)
+        #expect(Self.resumableCallError { try call.resume(failing: SuspensionRequest()) } != nil)
+        #expect(throws: ResumableCallError.self) { try call.resume(throwing: SuspensionRequest()) }
+        #expect(call.suspension?.reason == suspension.reason)
+        #expect(!call.isFinished)
+        // The guest did not go on past the host call.
+        #expect(fixture.calls["effect"] == [[.i32(1)]])
+        #expect(try fixture.export("writes")() == [.i32(1)])
+        #expect(fixture.count("suspend") == 1)
+        // The call still accepts the right results.
+        _ = try Self.suspension(try call.resume(returning: [.i32(35)]))
+        #expect(fixture.calls["effect"] == [[.i32(1)], [.i32(2)]])
+    }
+
+    @Test(arguments: testedThreadingModels)
+    func droppingSuspendedCallReleasesIt(threadingModel: EngineConfiguration.ThreadingModel) throws {
+        let fixture = try Fixture(
+            Self.nested, threadingModel: threadingModel, hosts: ["suspend": Self.suspend, "effect": { _, _ in [] }])
         weak var dropped: ResumableCall?
         do {
-            let call = try ResumableCall(function: run, arguments: [.i32(3)])
-            let suspension = try Self.suspension(try call.resume())
-            #expect(Self.refusal { try call.resume(returning: [], answering: suspension) } != nil)
-            #expect(Self.refusal { try call.resume(returning: [.i64(1)], answering: suspension) } != nil)
-            #expect(Self.refusal { try call.resume(returning: [.i32(1), .i32(2)], answering: suspension) } != nil)
-            #expect(Self.refusal { try call.resume(returning: [.i32(1)], answering: otherSuspension) } != nil)
-            #expect(Self.refusal { try call.resume() } != nil)
-            #expect(Self.refusal { try call.resume(failing: SuspensionRequest(), answering: suspension) } != nil)
-            #expect(throws: ResumableCallError.self) { try call.resume(throwing: SuspensionRequest()) }
-            #expect(call.suspension?.reason == suspension.reason)
-            #expect(!call.isFinished)
+            let call = try ResumableCall(function: try fixture.export("run"), arguments: [.i32(3)])
+            _ = try Self.suspension(try call.resume())
             dropped = call
         }
         #expect(dropped == nil)
-        // Neither the refusals nor the drop let the guest go on past the host call.
-        #expect(fixture.calls["effect"] == [[.i32(1)], [.i32(1)]])
-        #expect(try fixture.export("writes")() == [.i32(2)])
-        #expect(fixture.count("suspend") == 2)
-        // The other call of the store still takes its answer.
-        _ = try Self.suspension(try other.resume(returning: [.i32(45)], answering: otherSuspension))
-        #expect(fixture.calls["effect"] == [[.i32(1)], [.i32(1)], [.i32(2)]])
+        #expect(fixture.calls["effect"] == [[.i32(1)]])
     }
 
     // MARK: Memory
 
     @Test(arguments: testedThreadingModels, [EngineConfiguration.MemoryBoundsChecking.mprotect, .software])
-    func memoryWrittenAndGrownDuringASuspensionIsSeen(
+    func memoryWrittenAndGrownDuringSuspensionIsSeen(
         threadingModel: EngineConfiguration.ThreadingModel,
         memoryBoundsChecking: EngineConfiguration.MemoryBoundsChecking
     ) throws {
@@ -1085,7 +1037,7 @@ struct ResumableHostCallTests {
             Self.reentry, threadingModel: threadingModel, memoryBoundsChecking: memoryBoundsChecking,
             hosts: ["suspend": Self.suspend, "reenter": { _, _ in [.i32(0)] }])
         let call = try ResumableCall(function: try fixture.export("mem"))
-        let suspension = try Self.suspension(try call.resume())
+        _ = try Self.suspension(try call.resume())
         let memory = try #require(fixture.instance.exports[memory: "memory"])
         // Only a memory in a reserved region keeps its base when it grows. The engine can keep
         // `.mprotect` and still place the memory in one allocation, as it does on Android.
@@ -1097,11 +1049,11 @@ struct ResumableHostCallTests {
         memory.withUnsafeMutableBufferPointer(offset: 20, count: 4) { bytes in
             bytes.storeBytes(of: UInt32(100).littleEndian, as: UInt32.self)
         }
-        // A plain call grows the memory while the call is suspended. A memory in one allocation
-        // is replaced by growing, so the guest has to find it anew.
+        // Another call grows the memory while the call is suspended. A memory in one allocation
+        // moves when it grows, so the guest has to find it anew.
         #expect(try fixture.export("grow")() == [.i32(1)])
         #expect((base() != before) == !reserved)
-        #expect(try Self.results(try call.resume(returning: [.i32(0)], answering: suspension)) == [.i32(41 + 100 + 2 + 5)])
+        #expect(try Self.results(try call.resume(returning: [.i32(0)])) == [.i32(41 + 100 + 2 + 5)])
     }
 
     static let outOfBounds = """
@@ -1113,7 +1065,7 @@ struct ResumableHostCallTests {
         """
 
     @Test(arguments: testedThreadingModels, [EngineConfiguration.MemoryBoundsChecking.mprotect, .software])
-    func anOutOfBoundsAccessAfterAnAnswerTraps(
+    func outOfBoundsAccessAfterResumingTraps(
         threadingModel: EngineConfiguration.ThreadingModel,
         memoryBoundsChecking: EngineConfiguration.MemoryBoundsChecking
     ) throws {
@@ -1121,12 +1073,12 @@ struct ResumableHostCallTests {
             Self.outOfBounds, threadingModel: threadingModel, memoryBoundsChecking: memoryBoundsChecking,
             hosts: ["suspend": Self.suspend])
         let inBounds = try ResumableCall(function: try fixture.export("load"))
-        let first = try Self.suspension(try inBounds.resume())
-        #expect(try Self.results(try inBounds.resume(returning: [.i32(0)], answering: first)) == [.i32(0)])
+        _ = try Self.suspension(try inBounds.resume())
+        #expect(try Self.results(try inBounds.resume(returning: [.i32(0)])) == [.i32(0)])
         let outside = try ResumableCall(function: try fixture.export("load"))
-        let second = try Self.suspension(try outside.resume())
+        _ = try Self.suspension(try outside.resume())
         var error: (any Error)?
-        do { _ = try outside.resume(returning: [.i32(8)], answering: second) } catch let caught { error = caught }
+        do { _ = try outside.resume(returning: [.i32(8)]) } catch let caught { error = caught }
         guard let trap = error as? Trap, case .memoryOutOfBounds = trap.reason else {
             Issue.record("expected an out-of-bounds trap, got \(String(describing: error))")
             return
