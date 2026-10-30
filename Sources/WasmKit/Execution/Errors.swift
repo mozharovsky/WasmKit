@@ -128,7 +128,7 @@ package enum TrapReason: Error, CustomStringConvertible, Sendable {
     case nullFunctionReference
     /// `ref.as_non_null` was given a null reference.
     case nullReference
-    /// A host function threw ``SuspensionRequest`` into a call that cannot be suspended.
+    /// A host function threw ``SuspensionRequest`` where the call cannot be suspended.
     case suspensionUnavailable
 
     /// The description of the trap reason.
@@ -159,7 +159,7 @@ package enum TrapReason: Error, CustomStringConvertible, Sendable {
         case .nullReference:
             return "null reference"
         case .suspensionUnavailable:
-            return "a host function asked to suspend a call that cannot be suspended"
+            return "a host function requested a suspension, but the call cannot be suspended"
         case .indirectCallToNull(let elementIndex):
             return "indirect call to null element (uninitialized element \(elementIndex))"
         case .typeMismatchCall(let actual, let expected):

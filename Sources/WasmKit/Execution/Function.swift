@@ -262,9 +262,8 @@ extension InternalFunction {
                 }
             }
         } catch is SuspensionRequest {
-            // No guest called this host function, so there is nothing to suspend. Passing the
-            // request on would let a host function that called this one rethrow it, and suspend
-            // whatever called that one instead.
+            // No guest called this host function, so nothing can suspend. Rethrowing the request
+            // could suspend an unrelated outer call.
             throw Trap(.suspensionUnavailable)
         }
         try check(functionType: resolvedType, results: results)

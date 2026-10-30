@@ -285,8 +285,8 @@ For a host function the second and third step are the same with no locals and
 no constants, and the next instruction returns from the new frame. A trap from
 the host function is reported from the current frame, so the runtime writes its
 saved slots back below the current `sp` before the trap leaves `tailInvoke`. A
-`ResumableCall` suspended at the host call keeps the new frame as it is and
-continues there once the call is answered.
+`ResumableCall` suspended at the host call keeps the new frame and continues
+there when it resumes.
 
 ### Example
 
