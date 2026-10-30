@@ -1,5 +1,4 @@
-/// This example demonstrates how a host function can suspend the guest, and how to resume the
-/// guest later with the function's result.
+/// This example demonstrates how a host function can suspend the guest until its result is ready.
 
 import WasmKit
 import WAT
@@ -18,14 +17,13 @@ struct Example {
         var lookups = 0
         let lookup = Function(store: store, parameters: [.i32], results: [.i32]) { _, arguments in
             lookups += 1
-            // The result is not ready yet, so suspend the guest instead of blocking this thread.
+            // Suspend instead of blocking this thread until the result is ready.
             throw SuspensionRequest(id: UInt64(arguments[0].i32))
         }
         let module = try parseWasm(bytes: try wat2wasm(wat))
         let instance = try module.instantiate(store: store, imports: ["env": ["lookup": lookup]])
         let total = instance.exports[function: "total"]!
 
-        // Resume each suspended host call with a value fetched asynchronously.
         let call = try ResumableCall(function: total)
         var status = try call.resume()
         while case .suspended(let suspension) = status, case .hostCall(let id, _) = suspension.reason {
@@ -37,7 +35,6 @@ struct Example {
             print("total returned \(results), and lookup ran \(lookups) times")
         }
 
-        // Cancelling ends a suspended call without running any more of the guest.
         let cancelled = try ResumableCall(function: total)
         _ = try cancelled.resume()
         do {

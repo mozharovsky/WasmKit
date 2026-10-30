@@ -4,10 +4,9 @@ import WasmParser
 
 @testable import WasmKit
 
-/// Host call suspensions in calls that also use fuel metering or epoch interruption.
+/// Host call suspensions together with fuel metering and epoch interruption.
 ///
-/// Resuming from a host call charges no fuel and checks no epoch. The guest spends the same fuel
-/// and stops at the same checks as it does with a synchronous host function.
+/// Resuming from a host call charges no fuel and checks no epoch.
 @Suite
 struct ResumableHostCallFuelEpochTests {
     static let features: WasmFeatureSet = [.referenceTypes, .exceptionHandling, .tailCall]
@@ -27,11 +26,11 @@ struct ResumableHostCallFuelEpochTests {
             (local.get $sum)))
         """
 
-    /// What the host functions of a ``Guest`` do and saw.
+    /// Controls the host functions of a ``Guest`` and records their calls.
     final class Log {
         /// Whether `ask` suspends instead of returning.
         var suspends = false
-        /// The `ask` call, counted from zero, that empties the store's fuel before it returns.
+        /// The step at which `ask` empties the store's fuel.
         var emptiesFuelAt: UInt32?
         /// Every host call, in order, as `ask i` or `note i`.
         var events: [String] = []
@@ -47,13 +46,7 @@ struct ResumableHostCallFuelEpochTests {
         let function: Function
         let log: Log
 
-        /// Instantiates ``asking`` on a new store.
-        ///
-        /// - Parameters:
-        ///   - threadingModel: The threading model of the engine.
-        ///   - fuel: A budget, which also turns fuel metering on.
-        ///   - epochInterruption: Whether the engine instruments the guest with epoch checks. The
-        ///     store's deadline stays at "never" until a test sets one.
+        /// Instantiates ``asking`` on a new store. A `fuel` budget turns fuel metering on.
         init(threadingModel: EngineConfiguration.ThreadingModel, fuel: UInt64? = nil, epochInterruption: Bool = false)
             throws
         {
@@ -123,8 +116,7 @@ struct ResumableHostCallFuelEpochTests {
     static let steps: UInt32 = 6
     static let sum: [Value] = [.i32((0..<steps).reduce(0) { $0 + $1 * 2 })]
 
-    /// The results, the spent fuel, and the host call log of a call through `invoke` with a
-    /// synchronous `ask`.
+    /// Runs `f` through `invoke` with a synchronous `ask`.
     static func synchronousRun(
         _ threadingModel: EngineConfiguration.ThreadingModel, epochInterruption: Bool = false
     ) throws -> (results: [Value], fuel: UInt64, events: [String]) {
@@ -153,7 +145,6 @@ struct ResumableHostCallFuelEpochTests {
                 Issue.record("the host function ran again at step \(id)")
                 return
             }
-            // The call needs results, so `resume()` throws instead of retrying a fuel charge.
             #expect(throws: ResumableCallError.self) { try call.resume() }
             status = try call.resume(returning: [.i32(UInt32(id) * 2)])
         }
@@ -162,9 +153,8 @@ struct ResumableHostCallFuelEpochTests {
         #expect(guest.log.events == reference.events)
     }
 
-    /// Resuming with results while the store has no fuel suspends at the next fuel charge. Adding
-    /// fuel then retries that charge and nothing before it. A synchronous host function that
-    /// empties the fuel makes `invoke` trap at the same place.
+    /// Resuming with results on an empty store suspends at the charge where `invoke` traps.
+    /// Refilling retries only that charge.
     @Test(arguments: testedThreadingModels)
     func resumingWithoutFuelSuspendsAtNextCharge(threadingModel: EngineConfiguration.ThreadingModel) throws {
         let reference = try Self.synchronousRun(threadingModel)
@@ -188,15 +178,12 @@ struct ResumableHostCallFuelEpochTests {
             Issue.record("expected an out-of-fuel suspension, got \(outOfFuel.reason)")
             return
         }
-        // The guest ran exactly as far as the synchronous one, and the host function ran once.
         #expect(guest.log.events == emptied.log.events)
         #expect(guest.log.count("ask") == 1)
         #expect(
             ResumableHostCallTests.resumableCallError { try call.resume(returning: [.i32(0)]) }
                 == ResumableCallError.notSuspendedAtHostCall.description)
 
-        // With just enough fuel each time, the rest of the call alternates between fuel and host
-        // call suspensions.
         try meter.refill(guest, with: required)
         var status = try call.resume()
         var fuelSuspensions = 1
@@ -223,16 +210,14 @@ struct ResumableHostCallFuelEpochTests {
         #expect(try ResumableHostCallTests.results(status) == reference.results)
         #expect(meter.spent == reference.fuel)
         #expect(guest.log.events == reference.events)
-        // Each later step suspends for fuel at its loop header, because each refill covers only one
-        // charge.
+        // Each refill covers one charge, so every later loop header suspends.
         #expect(fuelSuspensions >= Int(Self.steps) - 1, "\(fuelSuspensions) fuel suspensions")
     }
 
     // MARK: Epoch
 
-    /// The epoch passes the deadline while the call is suspended at a host call. After resuming,
-    /// the guest reports its step and stops at the next epoch check, the loop header. After the
-    /// last host call the loop ends without a check, so the call returns past the deadline.
+    /// A deadline passed during a host call suspension stops the guest at the next loop header.
+    /// The last step leaves the loop without a check.
     @Test(arguments: testedThreadingModels)
     func epochDeadlineDuringHostCallSuspensionStopsAtNextCheck(
         threadingModel: EngineConfiguration.ThreadingModel
@@ -254,7 +239,6 @@ struct ResumableHostCallFuelEpochTests {
                 }
                 let seen = guest.log.events.count
                 ticker.increment()
-                // `resume()` neither retries the host call nor checks the epoch.
                 #expect(throws: ResumableCallError.self) { try call.resume() }
                 status = try call.resume(returning: [.i32(UInt32(id) * 2)])
                 #expect(guest.log.events[seen...] == ["note \(id)"])
@@ -276,8 +260,8 @@ struct ResumableHostCallFuelEpochTests {
 
     // MARK: Both
 
-    /// Fuel, epoch and host call suspensions in one call keep their reasons, and each continues
-    /// only the way its reason allows. The fuel spent matches a call through `invoke`.
+    /// Each suspension in a mixed call continues only its own way, and the call spends the fuel of
+    /// `invoke`.
     @Test(arguments: testedThreadingModels)
     func fuelEpochAndHostCallSuspensionsAreDistinct(threadingModel: EngineConfiguration.ThreadingModel) throws {
         let reference = try Self.synchronousRun(threadingModel, epochInterruption: true)

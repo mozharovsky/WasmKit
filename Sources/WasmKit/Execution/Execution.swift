@@ -952,7 +952,6 @@ extension Execution {
                 // from it, but the moved arguments may cover the frame's saved slots. A trap ends
                 // the call, so nothing reads the arguments again and the slots can be put back.
                 // Other errors build no backtrace from here and leave the moved frame as it is.
-                // A suspension is one of these other errors, so the call resumes in the moved frame.
                 saved.store(below: sp)
                 throw trap
             }
@@ -1077,13 +1076,11 @@ extension Execution {
         return (iseq.baseAddress, newSp)
     }
 
-    /// Executes the given host function, and suspends the running ``ResumableCall`` if the host
-    /// function throws a ``SuspensionRequest``.
+    /// Executes the given host function, turning a ``SuspensionRequest`` into a suspension.
     ///
     /// - Parameters:
     ///   - sp: The frame that continues after the call. For a tail call, the moved frame.
-    ///   - parameterArea: Where the arguments are and where the results go.
-    ///   - pc: Where the frame continues after the call.
+    ///   - pc: Where that frame continues.
     @inline(never)
     private func invokeHostFunction(
         function: EntityHandle<HostFunctionEntity>, sp: Sp, parameterArea: Sp, pc: Pc
@@ -1095,16 +1092,7 @@ extension Execution {
         }
     }
 
-    /// Returns the error that suspends the running ``ResumableCall`` at a host call.
-    ///
-    /// A call made with ``Function/invoke(_:)`` cannot suspend, because the suspension would lose
-    /// the native frames of the host function that called `invoke`.
-    ///
-    /// - Parameters:
-    ///   - sp: The frame that continues after the call.
-    ///   - pc: Where that frame continues.
-    ///   - parameterArea: Where the arguments are and where the results go.
-    /// - Returns: The ``SuspensionSignal`` to throw, or a trap if the call cannot suspend.
+    /// Returns the ``SuspensionSignal`` for `request`, or a trap if the call cannot suspend.
     @inline(never)
     private static func suspensionError(
         _ request: SuspensionRequest, function: EntityHandle<HostFunctionEntity>,

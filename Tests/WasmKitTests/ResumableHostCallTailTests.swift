@@ -4,11 +4,9 @@ import WasmParser
 
 @testable import WasmKit
 
-/// Suspensions at host calls that the guest reaches through a tail call.
+/// Host call suspensions reached through the tail calls of ``TailCallHostTrapTests/wat``.
 ///
-/// The guest is ``TailCallHostTrapTests/wat``. A tail call to a host function moves its arguments
-/// and runs the host function in a frame above them. A suspended call resumes in that moved frame,
-/// so the suspension must not write back the saved slots of the caller as a trap does.
+/// A trap writes back the caller's saved slots. A suspension must keep the moved frame.
 @Suite
 struct ResumableHostCallTailTests {
     typealias Path = TailCallHostTrapTests.Path
@@ -27,8 +25,7 @@ struct ResumableHostCallTailTests {
         [false, true].map { Configuration(threadingModel: model, epochInterruption: $0) }
     }
 
-    /// Controls the host functions of the guest. While `suspends` is true they suspend. Otherwise
-    /// they throw `failure` if it is set, or return the sum of their arguments.
+    /// Whether the host functions suspend or throw `failure`. Otherwise they sum their arguments.
     final class Host {
         var suspends = true
         var failure: (any Error)?
@@ -44,8 +41,7 @@ struct ResumableHostCallTailTests {
         }
     }
 
-    /// Starts a resumable call of `path`'s runner and checks that it suspends once at the host
-    /// call, with the path's arguments.
+    /// Starts `path`'s runner and expects one host call suspension with the path's arguments.
     static func suspend(
         _ guest: TailCallHostTrapTests.Guest, path: Path, on stack: consuming ExecutionStack? = nil,
         sourceLocation: SourceLocation = #_sourceLocation
@@ -76,7 +72,6 @@ struct ResumableHostCallTailTests {
             try call.resume(returning: [.i32(sum)]))
         #expect(results == [.i32(sum &* 3)])
         #expect(guest.calls.arguments[path.host] == [path.arguments])
-        // The finished call hands its stack to the next one, which suspends and finishes there too.
         guard let stack = call.takeStack() else {
             Issue.record("expected the stack of the finished call")
             return
@@ -88,11 +83,9 @@ struct ResumableHostCallTailTests {
         #expect(guest.calls.arguments[path.host]?.count == 2)
     }
 
-    /// On the `partial` path, the saved SP of the host frame overlaps the saved function slot of
-    /// the caller. The saved PC and SP of the caller stay in place. If the suspension wrote back
-    /// the slots of the caller, it would overwrite that saved SP, and the resumed call would return
-    /// through a broken frame. `spill` cannot show this, because the saved slots of its host
-    /// frame lie above those of the caller.
+    /// On `partial`, the host frame's saved SP lands on the caller's saved function slot. Writing
+    /// back the caller's slots there would break the frame the resumed call returns through.
+    /// `spill` cannot show this, because its host frame's saved slots lie above the caller's.
     @Test(arguments: configurations)
     func partialPathResumesInMovedFrame(_ configuration: Configuration) throws {
         let host = Host()
@@ -107,16 +100,14 @@ struct ResumableHostCallTailTests {
         }
         TailCallHostTrapTests.expectHostTrap(trap, frames: ["partial", "run_partial"])
         #expect(guest.calls.arguments["three"]?.count == 2)
-        // The store still runs the same call synchronously.
         host.suspends = false
         #expect(try guest.export("run_partial")([.i32(9)]) == [.i32(36)])
     }
 
-    /// A trap thrown into a suspended host call, or a cancellation with a trap, is reported like
-    /// the trap of a synchronous host function at that call.
+    /// Failing or cancelling a suspended host call with a trap gives a synchronous trap's backtrace.
     ///
-    /// The frames and the trap site match. Only the address of the outermost frame differs,
-    /// because the called function returns to different code in `invoke` and in a resumable call.
+    /// Only the outermost address differs, because `invoke` and a resumable call return to
+    /// different code.
     @Test(arguments: configurations, Path.allCases)
     func trapAtSuspensionHasSynchronousBacktrace(_ configuration: Configuration, path: Path) throws {
         let host = Host()
@@ -149,8 +140,7 @@ struct ResumableHostCallTailTests {
     }
 
     /// An exception thrown into a host call suspended in `spill` reaches the handler below the
-    /// tail caller, as the exception of a synchronous host function does. Other errors pass
-    /// through unchanged.
+    /// tail caller, as a synchronous one does. Other errors pass through.
     @Test(arguments: configurations)
     func exceptionAtSuspensionReachesHandlerBelowTailCaller(_ configuration: Configuration) throws {
         let host = Host()
@@ -168,7 +158,6 @@ struct ResumableHostCallTailTests {
             try failed.resume(failing: TailCallHostTrapTests.HostFailure())
         }
         #expect(failed.isFinished)
-        // A synchronous run gets the same exception to the same handler.
         host.suspends = false
         host.failure = raised
         #expect(try guest.export("caught")([.i32(9)]) == [.i32(77)])

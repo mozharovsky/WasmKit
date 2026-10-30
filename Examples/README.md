@@ -23,7 +23,6 @@ swift run HostCallSuspension
 
 ## HostCallSuspension
 
-`HostCallSuspension` shows a host function that suspends the guest instead of blocking. The host
-function throws `SuspensionRequest`, so `resume()` returns `.suspended`. The example awaits a
-value for the host call, passes it to `resume(returning:)`, and the guest continues after the call.
-It also cancels a suspended call with `resume(throwing:)`.
+`HostCallSuspension` has a host function throw `SuspensionRequest` to suspend the guest instead of
+blocking. The host awaits a value and passes it to `resume(returning:)`, or cancels the call with
+`resume(throwing:)`.
