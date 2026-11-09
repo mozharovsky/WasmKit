@@ -14,9 +14,10 @@ import WasmTypes
 /// time, matching how vectored I/O was performed before the erasure existed.
 ///
 /// The iovec array is copied out of guest memory once, like `readv` and
-/// `writev` do, and every buffer is checked before the first one is used. A
-/// bad buffer therefore stops the call before any data moves, and a read into
-/// one buffer cannot change where a later one points.
+/// `writev` do, and every buffer and the total length are checked before the
+/// first buffer is used. A bad buffer or total therefore stops the call before
+/// any data moves. A read into one buffer cannot change where a later one
+/// points or how many bytes it holds.
 @_spi(WASIPlatform) public struct GuestBuffers {
     /// The number of buffers in the vector.
     public let count: Int
@@ -24,12 +25,26 @@ import WasmTypes
     private let access: (Int, (UnsafeMutableRawBufferPointer) throws -> Int) throws -> Int
 
     /// Throws ``WASIMemoryAccessError`` if the iovec array or any buffer it
-    /// describes does not lie inside `memory`.
+    /// describes does not lie inside `memory`. Throws `EINVAL` if the buffers
+    /// hold more bytes in total than a ``WASIAbi/Size`` can count.
+    ///
+    /// The call reports the number of bytes it transferred as a `size`, so a
+    /// larger total could not be reported. Buffers may overlap, so a small
+    /// memory can describe such a total. POSIX `readv` and `writev` fail the
+    /// same way, before any data moves, when the total overflows their result.
+    ///
+    /// Bounds are checked first, so a buffer outside memory stops the guest
+    /// even when the total is also too large.
     init<M: GuestMemory>(iovs: UnsafeGuestBufferPointer<WASIAbi.IOVec>, memory: M) throws {
         try iovs.checkBounds(in: memory)
         let iovecs = (0..<iovs.count).map { iovs.read(at: $0, in: memory) }
+        var total: UInt64 = 0
         for iovec in iovecs {
             try memory.checkBounds(iovec.buffer, count: UInt64(iovec.length))
+            total += UInt64(iovec.length)
+        }
+        guard total <= UInt64(WASIAbi.Size.max) else {
+            throw WASIAbi.Errno.EINVAL
         }
         self.count = iovecs.count
         self.access = { index, body in
